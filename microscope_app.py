@@ -146,47 +146,51 @@ class EdgeDetector:
         px = -ly
         py =  lx
 
+        # Cap n_samples to avoid slowness on tiny circles
+        n_samples = min(n_samples, max(64, int(radius * 4)))
         t = np.linspace(-radius, radius, n_samples)
 
-        # Sample multiple scan-lines parallel to the lines direction
-        n_scan = max(7, int(radius * 0.5))
+        # Cap scan lines: enough for averaging but never > 32
+        n_scan = min(32, max(7, int(radius * 0.3)))
         scan_offsets = np.linspace(-radius * 0.85, radius * 0.85, n_scan)
 
-        accum = np.zeros(n_samples, dtype=np.float64)
-        count = 0
-
-        img_f = image_gray.astype(np.float64)
+        # Build a (n_scan, n_samples) grid of (row, col) coordinates
+        # then use map_coordinates for fast batch bilinear interpolation
+        all_rows = []
+        all_cols = []
+        valid_scans = []
 
         for k in scan_offsets:
-            xs = cx + t * px + k * lx
-            ys = cy + t * py + k * ly
-
-            # check bounds
-            mask = (xs >= 0) & (xs < w - 1) & (ys >= 0) & (ys < h - 1)
-            if mask.sum() < n_samples * 0.4:
+            cols = cx + t * px + k * lx   # x → col
+            rows = cy + t * py + k * ly   # y → row
+            in_bounds = ((cols >= 0) & (cols < w - 1) &
+                         (rows >= 0) & (rows < h - 1))
+            if in_bounds.sum() < n_samples * 0.4:
                 continue
+            all_cols.append(cols)
+            all_rows.append(rows)
+            valid_scans.append(True)
 
-            # bilinear interpolation
-            x0 = np.floor(xs).astype(int)
-            y0 = np.floor(ys).astype(int)
-            x0 = np.clip(x0, 0, w - 2)
-            y0 = np.clip(y0, 0, h - 2)
-            wx = xs - x0
-            wy = ys - y0
-
-            row = (img_f[y0, x0] * (1 - wx) * (1 - wy)
-                 + img_f[y0, x0 + 1] * wx * (1 - wy)
-                 + img_f[y0 + 1, x0] * (1 - wx) * wy
-                 + img_f[y0 + 1, x0 + 1] * wx * wy)
-
-            row[~mask] = 0.0
-            accum += row
-            count += 1
-
-        if count == 0:
+        if not all_rows:
             return t, np.zeros(n_samples)
 
-        return t, accum / count
+        # Stack into 2-D arrays: shape (n_valid_scans, n_samples)
+        coords_r = np.vstack(all_rows)   # (S, N)
+        coords_c = np.vstack(all_cols)   # (S, N)
+
+        # map_coordinates expects (ndim, npoints); flatten, then reshape
+        S, N = coords_r.shape
+        flat_r = coords_r.ravel()
+        flat_c = coords_c.ravel()
+
+        sampled = ndimage.map_coordinates(
+            image_gray.astype(np.float64),
+            [flat_r, flat_c],
+            order=1,          # bilinear
+            mode='nearest',
+        ).reshape(S, N)
+
+        return t, sampled.mean(axis=0)
 
     @staticmethod
     def apply_algorithm(
@@ -581,9 +585,13 @@ class HistogramCanvas(FigureCanvas):
         self.ax.yaxis.label.set_color('#ccc')
 
     def plot(self, gray: np.ndarray, roi_mask: Optional[np.ndarray] = None):
+        data = gray[roi_mask] if roi_mask is not None else gray.ravel()
+        self.plot_data(data)
+
+    def plot_data(self, data: np.ndarray):
+        """Plot pre-extracted pixel values (called from main thread after worker)."""
         self.ax.cla()
         self._style()
-        data = gray[roi_mask] if roi_mask is not None else gray.ravel()
         if data.size == 0:
             self.draw()
             return
@@ -1058,6 +1066,92 @@ class ProfileCanvas(FigureCanvas):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MEASUREMENT WORKER  (runs on a background QThread)
+# ─────────────────────────────────────────────────────────────────────────────
+class MeasurementWorker(QObject):
+    """
+    All heavy computation lives here so the Qt main thread stays responsive.
+    Signals carry results back to the GUI thread.
+    """
+    finished = pyqtSignal(dict)   # emits result dict on success
+    error    = pyqtSignal(str)    # emits error string on failure
+
+    def __init__(self):
+        super().__init__()
+        self._params: Optional[Dict] = None
+        self._cancelled = False
+
+    def set_params(self, params: Dict):
+        self._params = params
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        if self._params is None or self._cancelled:
+            return
+        p = self._params
+        try:
+            gray      = p['gray']
+            cx        = p['cx']
+            cy        = p['cy']
+            r         = p['radius']
+            ang       = p['angle']
+            algo      = p['algo']
+            sigma     = p['sigma']
+            peak_mode = p['peak_mode']
+            threshold = p['threshold']
+            ppu       = p['pixels_per_um']
+
+            t, profile   = EdgeDetector.extract_profile(gray, cx, cy, r, ang)
+            if self._cancelled:
+                return
+            edge_signal  = EdgeDetector.apply_algorithm(profile, algo, sigma)
+            peak_indices = EdgeDetector.find_peaks(
+                edge_signal, profile, peak_mode, threshold)
+
+            meas = LineMeasurer.measure_widths(t, peak_indices, profile, ppu)
+            ler  = LineMeasurer.compute_ler(t, peak_indices, ppu)
+            lwr  = LineMeasurer.compute_lwr(t, peak_indices, profile, ppu)
+            pit  = LineMeasurer.pitch(t, peak_indices, ppu)
+
+            # Build histogram data inside the worker (avoids large mask on main thread)
+            h, w = gray.shape
+            r_int = int(r)
+            cx_i, cy_i = int(cx), int(cy)
+            y0 = max(0, cy_i - r_int)
+            y1 = min(h, cy_i + r_int + 1)
+            x0 = max(0, cx_i - r_int)
+            x1 = min(w, cx_i + r_int + 1)
+            roi_crop = gray[y0:y1, x0:x1]
+            # Build mask only on the small crop
+            if roi_crop.size > 0:
+                Yc, Xc = np.ogrid[:roi_crop.shape[0], :roi_crop.shape[1]]
+                mask = ((Xc - (cx - x0)) ** 2 +
+                        (Yc - (cy - y0)) ** 2) <= r ** 2
+                hist_data = roi_crop[mask].ravel()
+            else:
+                hist_data = gray.ravel()
+
+            self.finished.emit({
+                't':            t,
+                'profile':      profile,
+                'edge_signal':  edge_signal,
+                'peak_indices': peak_indices,
+                'meas':         meas,
+                'ler':          ler,
+                'lwr':          lwr,
+                'pitch':        pit,
+                'angle':        ang,
+                'hist_data':    hist_data,
+                'ppu':          ppu,
+            })
+        except Exception as e:
+            self.error.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
@@ -1096,10 +1190,20 @@ class MainWindow(QMainWindow):
         self._apply_dark_theme()
         self._load_settings()
 
+        # ── Background measurement worker ──────────────────────────────────
+        self._meas_worker  = MeasurementWorker()
+        self._meas_thread  = QThread(self)
+        self._meas_worker.moveToThread(self._meas_thread)
+        self._meas_thread.started.connect(self._meas_worker.run)
+        self._meas_worker.finished.connect(self._on_measurement_done)
+        self._meas_worker.error.connect(self._on_measurement_error)
+        self._meas_thread.start()
+
+        # Debounce timer: waits 120 ms of inactivity before triggering worker
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
-        self._update_timer.setInterval(80)
-        self._update_timer.timeout.connect(self._run_measurement)
+        self._update_timer.setInterval(120)
+        self._update_timer.timeout.connect(self._launch_measurement)
 
     # ── UI construction ────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1814,99 +1918,104 @@ class MainWindow(QMainWindow):
 
     # ── measurement scheduling ─────────────────────────────────────────────
     def _schedule_measurement(self):
+        """Restart debounce timer; actual work fires after 120 ms of quiet."""
         self._update_timer.start()
 
-    def _run_measurement(self):
-        # Use enhanced image if available, else processed
+    def _launch_measurement(self):
+        """Called by debounce timer — packages params and signals the worker."""
         gray = getattr(self, '_enhanced_image', None) or self._proc_image
         if gray is None:
             return
+        self._meas_worker.cancel()   # discard any in-flight computation
+        params = {
+            'gray':         gray,
+            'cx':           self.image_canvas.cx,
+            'cy':           self.image_canvas.cy,
+            'radius':       self.image_canvas.radius,
+            'angle':        self.spin_angle.value(),
+            'algo':         self.combo_algo.currentText(),
+            'sigma':        self.spin_sigma.value(),
+            'peak_mode':    self.combo_peaks.currentText(),
+            'threshold':    self.spin_threshold.value(),
+            'pixels_per_um': self.spin_scale.value(),
+        }
+        self._meas_worker.set_params(params)
+        self.lbl_status.setText("Measuring…")
+        # Re-trigger the thread's event loop by invoking run() via a queued call
+        QTimer.singleShot(0, self._meas_worker.run)
 
-        cx        = self.image_canvas.cx
-        cy        = self.image_canvas.cy
-        r         = self.image_canvas.radius
-        ang       = self.spin_angle.value()
-        algo      = self.combo_algo.currentText()
-        sigma     = self.spin_sigma.value()
-        peak_mode = self.combo_peaks.currentText()
-        threshold = self.spin_threshold.value()
-        ppu       = self.spin_scale.value()
+    # Kept for "Re-Measure Now" button — just restarts the debounce immediately
+    def _run_measurement(self):
+        self._update_timer.stop()
+        self._launch_measurement()
 
-        try:
-            t, profile = EdgeDetector.extract_profile(gray, cx, cy, r, ang)
-            edge_signal  = EdgeDetector.apply_algorithm(profile, algo, sigma)
-            peak_indices = EdgeDetector.find_peaks(
-                edge_signal, profile, peak_mode, threshold)
+    def _on_measurement_done(self, result: Dict):
+        """Slot called on main thread when worker emits finished."""
+        t            = result['t']
+        profile      = result['profile']
+        edge_signal  = result['edge_signal']
+        peak_indices = result['peak_indices']
+        meas         = result['meas']
+        ler          = result['ler']
+        lwr          = result['lwr']
+        pit          = result['pitch']
+        ppu          = result['ppu']
+        ang          = result['angle']
+        hist_data    = result['hist_data']
 
-            self._last_t            = t
-            self._last_profile      = profile
-            self._last_edge_signal  = edge_signal
-            self._last_peak_indices = peak_indices
+        self._last_t            = t
+        self._last_profile      = profile
+        self._last_edge_signal  = edge_signal
+        self._last_peak_indices = peak_indices
 
-            # Measurements
-            meas = LineMeasurer.measure_widths(t, peak_indices, profile, ppu)
-            ler  = LineMeasurer.compute_ler(t, peak_indices, ppu)
-            lwr  = LineMeasurer.compute_lwr(t, peak_indices, profile, ppu)
-            pit  = LineMeasurer.pitch(t, peak_indices, ppu)
+        # Labels
+        self.lbl_dark_med.setText(
+            f"{meas['dark_median']:.3f} µm" if meas['dark_median'] else "—")
+        self.lbl_bright_med.setText(
+            f"{meas['bright_median']:.3f} µm" if meas['bright_median'] else "—")
+        self.lbl_ler.setText(f"{ler:.3f} µm" if ler else "—")
+        self.lbl_lwr.setText(f"{lwr:.3f} µm" if lwr else "—")
+        self.lbl_pitch.setText(f"{pit:.3f} µm" if pit else "—")
+        self.lbl_n_edges.setText(str(len(peak_indices)))
+        self.lbl_angle_val.setText(f"{ang:.2f}°")
 
-            # Result labels
-            self.lbl_dark_med.setText(
-                f"{meas['dark_median']:.3f} µm" if meas['dark_median'] else "—")
-            self.lbl_bright_med.setText(
-                f"{meas['bright_median']:.3f} µm" if meas['bright_median'] else "—")
-            self.lbl_ler.setText(f"{ler:.3f} µm" if ler else "—")
-            self.lbl_lwr.setText(f"{lwr:.3f} µm" if lwr else "—")
-            self.lbl_pitch.setText(f"{pit:.3f} µm" if pit else "—")
-            self.lbl_n_edges.setText(str(len(peak_indices)))
-            self.lbl_angle_val.setText(f"{ang:.2f}°")
+        # Canvas overlays
+        self.image_canvas.line_angle_deg = ang
+        self.image_canvas.set_edge_positions(t, peak_indices)
 
-            # Canvas overlays
-            self.image_canvas.line_angle_deg = ang
-            self.image_canvas.set_edge_positions(t, peak_indices)
+        # Profile plot (matplotlib — keep lightweight)
+        self.profile_canvas.plot(t, profile, edge_signal, peak_indices, ppu)
 
-            # Profile plot
-            self.profile_canvas.plot(t, profile, edge_signal, peak_indices, ppu)
+        # Histogram — data already computed in worker
+        self.histogram_canvas.plot_data(hist_data)
 
-            # Histogram
-            self._update_histogram(gray, cx, cy, r)
+        # Persist result
+        if self._current_index >= 0 and self._image_files:
+            fp = self._image_files[self._current_index]
+            self._results[fp] = {
+                'filename':      Path(fp).name,
+                'dark_median':   meas['dark_median'],
+                'bright_median': meas['bright_median'],
+                'dark_widths':   meas['dark_widths'],
+                'bright_widths': meas['bright_widths'],
+                'ler':           ler,
+                'lwr':           lwr,
+                'pitch':         pit,
+                'angle':         ang,
+                'n_edges':       len(peak_indices),
+                'pixels_per_um': ppu,
+            }
+            self._update_file_table_row(self._current_index, meas)
 
-            # Store result
-            if self._current_index >= 0 and self._image_files:
-                fp = self._image_files[self._current_index]
-                self._results[fp] = {
-                    'filename':      Path(fp).name,
-                    'dark_median':   meas['dark_median'],
-                    'bright_median': meas['bright_median'],
-                    'dark_widths':   meas['dark_widths'],
-                    'bright_widths': meas['bright_widths'],
-                    'ler':           ler,
-                    'lwr':           lwr,
-                    'pitch':         pit,
-                    'angle':         ang,
-                    'n_edges':       len(peak_indices),
-                    'pixels_per_um': ppu,
-                }
-                self._update_file_table_row(self._current_index, meas)
+        self.lbl_status.setText(
+            f"Edges: {len(peak_indices)} | "
+            f"Dark: {meas['dark_median']:.3f} µm | "
+            f"Bright: {meas['bright_median']:.3f} µm | "
+            f"LER: {ler:.3f} µm  LWR: {lwr:.3f} µm")
 
-            self.lbl_status.setText(
-                f"Edges: {len(peak_indices)} | "
-                f"Dark: {meas['dark_median']:.3f} µm | "
-                f"Bright: {meas['bright_median']:.3f} µm | "
-                f"LER: {ler:.3f} µm  LWR: {lwr:.3f} µm")
-
-        except Exception as e:
-            self.lbl_status.setText(f"Measurement error: {e}")
-            traceback.print_exc()
-
-    def _update_histogram(self, gray: np.ndarray, cx: float, cy: float, r: float):
-        """Update histogram restricted to circle ROI."""
-        try:
-            h, w = gray.shape
-            Y, X = np.ogrid[:h, :w]
-            mask = ((X - cx) ** 2 + (Y - cy) ** 2) <= r ** 2
-            self.histogram_canvas.plot(gray, mask)
-        except Exception:
-            self.histogram_canvas.plot(gray)
+    def _on_measurement_error(self, msg: str):
+        self.lbl_status.setText(f"Measurement error — see console")
+        print(msg, file=sys.stderr)
 
     def _update_file_table_row(self, idx: int, meas: Dict):
         if 0 <= idx < self.file_table.rowCount():
@@ -2211,6 +2320,10 @@ class MainWindow(QMainWindow):
             self._camera_thread.stop()
         if self._batch_thread and self._batch_thread.isRunning():
             self._batch_thread.stop()
+        # Shut down the measurement worker thread cleanly
+        self._meas_worker.cancel()
+        self._meas_thread.quit()
+        self._meas_thread.wait(2000)
         super().closeEvent(event)
 
 
