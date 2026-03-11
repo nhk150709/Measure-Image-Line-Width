@@ -539,6 +539,7 @@ class MainWindow(QMainWindow):
                 self._current_roi,
                 path,
                 um_per_px=recipe.scale_um_per_px,
+                direction=recipe.profile_direction,
             )
             self._status_label.setText(f"Saved annotated image: {path}")
 

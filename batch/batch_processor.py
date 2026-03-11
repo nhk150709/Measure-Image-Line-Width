@@ -18,10 +18,15 @@ from core.calibration import Calibration
 from core.preprocessor import Preprocessor
 from core.angle_detector import detect_angle, rotate_image
 from core.profile_extractor import extract_averaged_profile
-from core.stripe_detector import detect_stripes
-from core.measurements import compute_measurements_from_detection, MeasurementResult
+from core.stripe_detector import detect_stripes, StripeDetectionResult
+from core.measurements import (
+    compute_measurements_from_detection,
+    compute_per_stripe_roughness,
+    MeasurementResult,
+)
 from core.recipe import Recipe
-from export.csv_exporter import export_results_csv
+from export.csv_exporter import export_results_csv, export_stripe_rows_csv
+from export.annotated_image import save_annotated_image
 
 
 class BatchProcessor:
@@ -47,6 +52,8 @@ class BatchProcessor:
         self,
         image_dir: str,
         output_csv: str | None = None,
+        annotated_dir: str | None = None,
+        output_stripes_csv: str | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         error_callback: Callable[[str, str], None] | None = None,
     ) -> pd.DataFrame:
@@ -55,19 +62,25 @@ class BatchProcessor:
 
         Parameters
         ----------
-        image_dir        : directory containing images
-        output_csv       : if given, write results to this path after processing
-        progress_callback: called as (current_index, total, filename)
-        error_callback   : called as (filename, error_message) on per-image errors
+        image_dir          : directory containing images
+        output_csv         : if given, write summary results to this path
+        annotated_dir      : if given, save annotated PNG per image here
+        output_stripes_csv : if given, write per-stripe rows to this path
+        progress_callback  : called as (current_index, total, filename)
+        error_callback     : called as (filename, error_message) on per-image errors
 
         Returns
         -------
-        pd.DataFrame of all measurement results
+        pd.DataFrame of all summary measurement results
         """
         self._cancel = False
         image_paths = list_images_in_directory(image_dir)
         total = len(image_paths)
-        rows = []
+        rows: list[dict] = []
+        stripe_rows: list[dict] = []
+
+        if annotated_dir:
+            os.makedirs(annotated_dir, exist_ok=True)
 
         recipe = self.recipe
         calibration = Calibration.from_dict(
@@ -88,8 +101,21 @@ class BatchProcessor:
                 progress_callback(idx, total, fname)
 
             try:
-                row = self._process_one(path, recipe, calibration, preprocessor)
+                row, per_stripe, rotated, detection, roi, cal = self._process_one(
+                    path, recipe, calibration, preprocessor
+                )
                 rows.append(row)
+                stripe_rows.extend(per_stripe)
+
+                if annotated_dir:
+                    stem = os.path.splitext(fname)[0]
+                    out_path = os.path.join(annotated_dir, f"{stem}_annotated.png")
+                    save_annotated_image(
+                        rotated, detection, roi, out_path,
+                        um_per_px=cal.um_per_px,
+                        direction=recipe.profile_direction,
+                    )
+
             except Exception as exc:
                 msg = f"{type(exc).__name__}: {exc}"
                 if error_callback:
@@ -102,9 +128,12 @@ class BatchProcessor:
             progress_callback(total, total, "Done")
 
         df = pd.DataFrame(rows) if rows else pd.DataFrame()
-
         if output_csv and not df.empty:
             export_results_csv(df, output_csv)
+
+        stripe_df = pd.DataFrame(stripe_rows) if stripe_rows else pd.DataFrame()
+        if output_stripes_csv and not stripe_df.empty:
+            export_stripe_rows_csv(stripe_df, output_stripes_csv)
 
         return df
 
@@ -116,15 +145,25 @@ class BatchProcessor:
         recipe: Recipe,
         calibration: Calibration,
         preprocessor: Preprocessor,
-    ) -> dict:
-        """Process a single image and return a result dict."""
+    ) -> tuple[dict, list[dict], object, StripeDetectionResult, tuple | None, Calibration]:
+        """Process a single image and return (summary_row, stripe_rows, rotated, detection, roi, cal)."""
         img_data = load_image(path)
 
         # Override calibration if image has embedded metadata
+        cal = calibration
         if img_data.metadata_um_per_px is not None and recipe.scale_source == "metadata":
-            calibration = Calibration.from_metadata(img_data.metadata_um_per_px)
+            cal = Calibration.from_metadata(img_data.metadata_um_per_px)
 
         processed = preprocessor.process(img_data.pixels)
+
+        # Apply crop
+        cx, cy = recipe.crop_x_px, recipe.crop_y_px
+        if cx > 0 or cy > 0:
+            ph, pw = processed.shape[:2]
+            processed = processed[
+                cy: ph - cy if cy else ph,
+                cx: pw - cx if cx else pw,
+            ]
 
         # Apply ROI
         roi = recipe.roi_tuple
@@ -162,17 +201,43 @@ class BatchProcessor:
         )
         detection.angle_deg = angle_deg
 
-        # Compute measurements
+        # Compute summary measurements
         result = compute_measurements_from_detection(
-            detection,
-            calibration,
-            image=rotated,
-            roi=roi,
+            detection, cal,
+            image=rotated, roi=roi,
             edge_method=recipe.edge_method,
             edge_threshold_fraction=recipe.threshold_fraction,
         )
 
-        row = result.to_dict(image_file=os.path.basename(path))
-        row["timestamp"] = datetime.now().isoformat(timespec="seconds")
-        row["recipe_name"] = recipe.name
-        return row
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        fname = os.path.basename(path)
+
+        summary_row = result.to_dict(image_file=fname)
+        summary_row["timestamp"] = timestamp
+        summary_row["recipe_name"] = recipe.name
+
+        # Per-stripe roughness
+        per_stripe_roughness = compute_per_stripe_roughness(
+            detection, cal, rotated, roi,
+            edge_method=recipe.edge_method,
+            edge_threshold_fraction=recipe.threshold_fraction,
+        )
+
+        stripe_rows: list[dict] = []
+        for i, stripe in enumerate(detection.stripes):
+            srow = {
+                "image_file": fname,
+                "stripe_index": i,
+                "kind": stripe.kind,
+                "width_um": stripe.width_px * cal.um_per_px,
+                "left_edge_um": stripe.left_edge_px * cal.um_per_px,
+                "right_edge_um": stripe.right_edge_px * cal.um_per_px,
+                "center_um": stripe.center_px * cal.um_per_px,
+                "recipe_name": recipe.name,
+                "timestamp": timestamp,
+            }
+            if i < len(per_stripe_roughness):
+                srow.update(per_stripe_roughness[i].to_dict())
+            stripe_rows.append(srow)
+
+        return summary_row, stripe_rows, rotated, detection, roi, cal
