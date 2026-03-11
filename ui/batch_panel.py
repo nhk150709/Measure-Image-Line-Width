@@ -49,7 +49,7 @@ class _BatchWorker(QObject):
 class BatchDialog(QDialog):
     """Batch processing dialog."""
 
-    def __init__(self, recipe: Recipe, parent=None):
+    def __init__(self, recipe: Recipe, parent=None, prefill_dir: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("Batch Processing")
         self.setMinimumSize(520, 440)
@@ -106,6 +106,12 @@ class BatchDialog(QDialog):
         btn_row.addStretch()
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
+
+        # Pre-fill directory if supplied by caller
+        if prefill_dir:
+            self._dir_edit.setText(prefill_dir)
+            base = os.path.basename(prefill_dir.rstrip("/\\"))
+            self._out_edit.setText(os.path.join(prefill_dir, f"{base}_results.csv"))
 
     # ──────────────────────────────────────────────────────────────────
 

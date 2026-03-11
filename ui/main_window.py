@@ -181,9 +181,11 @@ class MainWindow(QMainWindow):
         act_run.triggered.connect(self._run_analysis)
         act_batch = QAction("Batch Processing…", self, shortcut="Ctrl+B")
         act_batch.triggered.connect(self._open_batch)
+        act_batch_dir = QAction("Batch Current Directory…", self, shortcut="Ctrl+Shift+B")
+        act_batch_dir.triggered.connect(self._batch_current_dir)
         act_cal = QAction("Set Scale from Scale Bar…", self)
         act_cal.triggered.connect(self._set_scale_from_scalebar)
-        analysis_menu.addActions([act_run, act_batch])
+        analysis_menu.addActions([act_run, act_batch, act_batch_dir])
         analysis_menu.addSeparator()
         analysis_menu.addAction(act_cal)
 
@@ -547,6 +549,15 @@ class MainWindow(QMainWindow):
     def _open_batch(self) -> None:
         recipe = self._recipe_panel.get_recipe()
         dialog = BatchDialog(recipe, parent=self)
+        dialog.exec_()
+
+    @pyqtSlot()
+    def _batch_current_dir(self) -> None:
+        if not self._image_dir:
+            QMessageBox.information(self, "No Directory", "Open a directory first.")
+            return
+        recipe = self._recipe_panel.get_recipe()
+        dialog = BatchDialog(recipe, parent=self, prefill_dir=self._image_dir)
         dialog.exec_()
 
     @pyqtSlot()
