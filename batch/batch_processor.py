@@ -22,6 +22,7 @@ from core.stripe_detector import detect_stripes, StripeDetectionResult
 from core.measurements import (
     compute_measurements_from_detection,
     compute_per_stripe_roughness,
+    collect_per_stripe_ler_points,
     MeasurementResult,
 )
 from core.recipe import Recipe
@@ -101,7 +102,7 @@ class BatchProcessor:
                 progress_callback(idx, total, fname)
 
             try:
-                row, per_stripe, rotated, detection, roi, cal = self._process_one(
+                row, per_stripe, rotated, detection, roi, cal, ler_points = self._process_one(
                     path, recipe, calibration, preprocessor
                 )
                 rows.append(row)
@@ -114,6 +115,7 @@ class BatchProcessor:
                         rotated, detection, roi, out_path,
                         um_per_px=cal.um_per_px,
                         direction=recipe.profile_direction,
+                        ler_points=ler_points,
                     )
 
             except Exception as exc:
@@ -145,8 +147,8 @@ class BatchProcessor:
         recipe: Recipe,
         calibration: Calibration,
         preprocessor: Preprocessor,
-    ) -> tuple[dict, list[dict], object, StripeDetectionResult, tuple | None, Calibration]:
-        """Process a single image and return (summary_row, stripe_rows, rotated, detection, roi, cal)."""
+    ) -> tuple[dict, list[dict], object, StripeDetectionResult, tuple | None, Calibration, list]:
+        """Process a single image and return (summary_row, stripe_rows, rotated, detection, roi, cal, ler_points)."""
         img_data = load_image(path)
 
         # Override calibration if image has embedded metadata
@@ -216,11 +218,18 @@ class BatchProcessor:
         summary_row["timestamp"] = timestamp
         summary_row["recipe_name"] = recipe.name
 
-        # Per-stripe roughness
+        # Per-stripe roughness and LER sample points for annotation
         per_stripe_roughness = compute_per_stripe_roughness(
             detection, cal, rotated, roi,
             edge_method=recipe.edge_method,
             edge_threshold_fraction=recipe.threshold_fraction,
+            direction=recipe.profile_direction,
+        )
+        ler_points = collect_per_stripe_ler_points(
+            detection, rotated, roi,
+            edge_method=recipe.edge_method,
+            edge_threshold_fraction=recipe.threshold_fraction,
+            direction=recipe.profile_direction,
         )
 
         stripe_rows: list[dict] = []
@@ -240,4 +249,4 @@ class BatchProcessor:
                 srow.update(per_stripe_roughness[i].to_dict())
             stripe_rows.append(srow)
 
-        return summary_row, stripe_rows, rotated, detection, roi, cal
+        return summary_row, stripe_rows, rotated, detection, roi, cal, ler_points

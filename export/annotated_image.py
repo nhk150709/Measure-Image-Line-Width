@@ -15,6 +15,7 @@ def draw_stripe_overlays(
     roi: tuple[int, int, int, int] | None,
     um_per_px: float = 1.0,
     direction: str = "horizontal",
+    ler_points: list | None = None,
     white_color: tuple = (255, 100, 100),   # BGR
     black_color: tuple = (100, 100, 255),
     edge_color: tuple = (0, 255, 0),
@@ -79,6 +80,14 @@ def draw_stripe_overlays(
             cv2.putText(out, label, (tx, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 0), 1, cv2.LINE_AA)
 
+    # LER sample points: orange for left edge, cyan for right edge
+    if ler_points:
+        for left_pts, right_pts in ler_points:
+            for px, py in left_pts:
+                cv2.circle(out, (int(px), int(py)), 2, (0, 140, 255), -1, cv2.LINE_AA)
+            for px, py in right_pts:
+                cv2.circle(out, (int(px), int(py)), 2, (255, 200, 0), -1, cv2.LINE_AA)
+
     # ROI rectangle
     if roi:
         x, y, w, h_roi = roi
@@ -94,8 +103,12 @@ def save_annotated_image(
     output_path: str,
     um_per_px: float = 1.0,
     direction: str = "horizontal",
+    ler_points: list | None = None,
 ) -> str:
     """Draw overlays and save to output_path (PNG). Returns path."""
-    annotated = draw_stripe_overlays(image, detection, roi, um_per_px, direction=direction)
+    annotated = draw_stripe_overlays(
+        image, detection, roi, um_per_px,
+        direction=direction, ler_points=ler_points,
+    )
     cv2.imwrite(output_path, annotated)
     return output_path

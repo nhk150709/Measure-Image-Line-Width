@@ -190,6 +190,34 @@ class ImageCanvas(QGraphicsView):
                 txt.setPos(cx - txt.boundingRect().width() / 2, cy - 8)
                 self._stripe_items.append(txt)
 
+    def draw_ler_points(
+        self,
+        ler_points: list[tuple[list, list]],
+        radius: float = 2.0,
+    ) -> None:
+        """Draw LER edge-sample dots on the canvas.
+
+        ler_points: per-stripe list of (left_pts, right_pts), each pt = (x, y).
+        Left-edge dots are drawn in orange; right-edge dots in cyan.
+        """
+        left_brush = QBrush(QColor(255, 140, 0))    # orange
+        right_brush = QBrush(QColor(0, 200, 255))   # cyan
+        no_pen = QPen(Qt.NoPen)
+
+        for left_pts, right_pts in ler_points:
+            for x, y in left_pts:
+                dot = self._scene.addEllipse(
+                    x - radius, y - radius, radius * 2, radius * 2,
+                    no_pen, left_brush,
+                )
+                self._stripe_items.append(dot)
+            for x, y in right_pts:
+                dot = self._scene.addEllipse(
+                    x - radius, y - radius, radius * 2, radius * 2,
+                    no_pen, right_brush,
+                )
+                self._stripe_items.append(dot)
+
     def draw_measurement_line(self, x1: int, y1: int, x2: int, y2: int,
                               label: str = "", color: QColor | None = None) -> None:
         c = color or QColor(255, 200, 0)
