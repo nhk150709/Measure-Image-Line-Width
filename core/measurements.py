@@ -165,6 +165,57 @@ def compute_measurements_from_detection(
     return result
 
 
+def compute_per_stripe_roughness(
+    detection: StripeDetectionResult,
+    calibration: Calibration,
+    image: np.ndarray,
+    roi: tuple | None,
+    edge_method: str,
+    edge_threshold_fraction: float,
+) -> list[RoughnessStats]:
+    """
+    Compute LER/LWR independently for every stripe in *detection*.
+
+    Returns a list of RoughnessStats aligned with detection.stripes.
+    Stripes whose edges cannot be located in enough rows get an empty
+    RoughnessStats (all metrics None).
+    """
+    from .edge_detector import find_edges
+
+    if roi is not None:
+        x, y, w, h = roi
+        region = image[y: y + h, x: x + w]
+    else:
+        region = image
+
+    n_rows = region.shape[0]
+    step = max(1, n_rows // 100)
+
+    results = []
+    for stripe in detection.stripes:
+        left_edges: list[float] = []
+        right_edges: list[float] = []
+        for row_idx in range(0, n_rows, step):
+            row_profile = region[row_idx, :].astype(float)
+            edges = find_edges(
+                row_profile,
+                method=edge_method,
+                threshold_fraction=edge_threshold_fraction,
+            )
+            if len(edges) < 2:
+                continue
+            center = stripe.center_px
+            lefts = [e for e in edges if e < center]
+            rights = [e for e in edges if e >= center]
+            if lefts and rights:
+                best_left = min(lefts, key=lambda e: abs(e - stripe.left_edge_px))
+                best_right = min(rights, key=lambda e: abs(e - stripe.right_edge_px))
+                left_edges.append(best_left * calibration.um_per_px)
+                right_edges.append(best_right * calibration.um_per_px)
+        results.append(RoughnessStats(left_edges, right_edges))
+    return results
+
+
 def _compute_ler_lwr(
     image: np.ndarray,
     roi: tuple | None,

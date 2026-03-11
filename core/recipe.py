@@ -29,6 +29,10 @@ class Recipe:
     filter_sigma: float = 2.0
     contrast_enhance: str = "none"   # "none" | "clahe" | "histogram_eq" | "normalize"
 
+    # Crop (pixels removed from each side before analysis)
+    crop_x_px: int = 0  # pixels removed from left and right
+    crop_y_px: int = 0  # pixels removed from top and bottom
+
     # Stripe detection
     threshold_fraction: float = 0.5
     min_stripe_width_px: float = 5.0

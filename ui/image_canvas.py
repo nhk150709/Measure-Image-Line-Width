@@ -137,15 +137,17 @@ class ImageCanvas(QGraphicsView):
     def draw_stripe_overlays(
         self, stripes, roi_offset=(0, 0),
         image_height=512, image_width=512,
-        direction="horizontal",
+        direction="horizontal", um_per_px: float = 1.0,
     ) -> None:
-        """Draw coloured bands for each detected stripe.
+        """Draw coloured bands for each detected stripe with width labels.
 
         direction='horizontal' — vertical stripes; bands are vertical columns.
         direction='vertical'   — horizontal stripes; bands are horizontal rows.
         """
         self.clear_stripe_overlays()
         edge_pen = QPen(QColor(0, 255, 100), 1)
+        label_color = QColor(255, 230, 0)
+        label_font = QFont("Arial", 8)
 
         if direction == "horizontal":
             ox = roi_offset[0]
@@ -160,6 +162,13 @@ class ImageCanvas(QGraphicsView):
                 l_line = self._scene.addLine(lx, 0, lx, h, edge_pen)
                 r_line = self._scene.addLine(rx, 0, rx, h, edge_pen)
                 self._stripe_items.extend([l_line, r_line])
+                # Width label at centre of band
+                cx = (lx + rx) / 2
+                cy = h / 4 if stripe.kind == "white" else 3 * h / 4
+                txt = self._scene.addText(f"{stripe.width_px * um_per_px:.2f}µm", label_font)
+                txt.setDefaultTextColor(label_color)
+                txt.setPos(cx - txt.boundingRect().width() / 2, cy - 8)
+                self._stripe_items.append(txt)
         else:  # "vertical" direction → horizontal stripes
             oy = roi_offset[1]
             w = image_width
@@ -173,6 +182,13 @@ class ImageCanvas(QGraphicsView):
                 t_line = self._scene.addLine(0, ty, w, ty, edge_pen)
                 b_line = self._scene.addLine(0, by, w, by, edge_pen)
                 self._stripe_items.extend([t_line, b_line])
+                # Width label at centre of band
+                cy = (ty + by) / 2
+                cx = w / 4 if stripe.kind == "white" else 3 * w / 4
+                txt = self._scene.addText(f"{stripe.width_px * um_per_px:.2f}µm", label_font)
+                txt.setDefaultTextColor(label_color)
+                txt.setPos(cx - txt.boundingRect().width() / 2, cy - 8)
+                self._stripe_items.append(txt)
 
     def draw_measurement_line(self, x1: int, y1: int, x2: int, y2: int,
                               label: str = "", color: QColor | None = None) -> None:

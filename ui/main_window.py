@@ -23,7 +23,9 @@ from core.preprocessor import Preprocessor
 from core.angle_detector import detect_angle, rotate_image
 from core.profile_extractor import extract_averaged_profile, extract_line_profile
 from core.stripe_detector import detect_stripes, StripeDetectionResult
-from core.measurements import compute_measurements_from_detection, MeasurementResult
+from core.measurements import (
+    compute_measurements_from_detection, compute_per_stripe_roughness, MeasurementResult,
+)
 from core.recipe import Recipe
 
 from ui.image_canvas import ImageCanvas
@@ -32,7 +34,7 @@ from ui.measurement_panel import MeasurementPanel
 from ui.profile_plot_widget import ProfilePlotWidget
 from ui.recipe_panel import RecipePanel
 from ui.batch_panel import BatchDialog
-from export.csv_exporter import export_results_csv, export_single_result
+from export.csv_exporter import export_results_csv, export_single_result, export_stripe_rows_csv
 from export.annotated_image import save_annotated_image
 
 import pandas as pd
@@ -54,6 +56,7 @@ class MainWindow(QMainWindow):
         self._result: MeasurementResult | None = None
         self._angle_deg: float = 0.0
         self._session_results: list[dict] = []
+        self._session_stripe_rows: list[dict] = []
 
         self._build_ui()
         self._apply_dark_style()
@@ -148,15 +151,17 @@ class MainWindow(QMainWindow):
         act_open.triggered.connect(self._open_directory)
         act_open_img = QAction("Open Single Image…", self, shortcut="Ctrl+Shift+O")
         act_open_img.triggered.connect(self._open_single_image)
-        act_export = QAction("Export CSV…", self, shortcut="Ctrl+E")
+        act_export = QAction("Export Summary CSV…", self, shortcut="Ctrl+E")
         act_export.triggered.connect(self._export_csv)
+        act_export_stripes = QAction("Export Individual Stripes CSV…", self, shortcut="Ctrl+Shift+E")
+        act_export_stripes.triggered.connect(self._export_stripe_csv)
         act_export_img = QAction("Save Annotated Image…", self)
         act_export_img.triggered.connect(self._save_annotated)
         act_quit = QAction("Quit", self, shortcut="Ctrl+Q")
         act_quit.triggered.connect(self.close)
         file_menu.addActions([act_open, act_open_img])
         file_menu.addSeparator()
-        file_menu.addActions([act_export, act_export_img])
+        file_menu.addActions([act_export, act_export_stripes, act_export_img])
         file_menu.addSeparator()
         file_menu.addAction(act_quit)
 
@@ -367,6 +372,23 @@ class MainWindow(QMainWindow):
                 contrast_enhance=recipe.contrast_enhance,
             )
             processed = preprocessor.process(self._current_img.pixels)
+
+            # Crop borders
+            cx, cy = recipe.crop_x_px, recipe.crop_y_px
+            if cx > 0 or cy > 0:
+                ph, pw = processed.shape[:2]
+                x1 = cx if cx > 0 else 0
+                x2 = pw - cx if cx > 0 else pw
+                y1 = cy if cy > 0 else 0
+                y2 = ph - cy if cy > 0 else ph
+                processed = processed[y1:y2, x1:x2]
+                self._canvas.set_image(processed)
+                # ROI coords must lie within cropped image; reset if out of bounds
+                if self._current_roi is not None:
+                    rx, ry, rw, rh = self._current_roi
+                    if rx < 0 or ry < 0 or rx + rw > x2 - x1 or ry + rh > y2 - y1:
+                        self._current_roi = None
+
             roi = self._current_roi or recipe.roi_tuple
 
             # Angle detection
@@ -417,23 +439,48 @@ class MainWindow(QMainWindow):
             )
 
             roi_offset = (roi[0], roi[1]) if roi else (0, 0)
-            img_h = self._current_img.pixels.shape[0]
-            img_w = self._current_img.pixels.shape[1]
+            img_h = processed.shape[0]
+            img_w = processed.shape[1]
             self._canvas.draw_stripe_overlays(
                 self._detection.stripes,
                 roi_offset=roi_offset,
                 image_height=img_h,
                 image_width=img_w,
                 direction=recipe.profile_direction,
+                um_per_px=calibration.um_per_px,
             )
 
-            # Store result for export
+            # Store summary result for export
             row = self._result.to_dict(
                 image_file=self._current_img.filename
             )
             row["timestamp"] = datetime.now().isoformat(timespec="seconds")
             row["recipe_name"] = recipe.name
             self._session_results.append(row)
+
+            # Per-stripe roughness and individual rows
+            per_stripe_roughness = compute_per_stripe_roughness(
+                self._detection, calibration,
+                rotated, roi,
+                edge_method=recipe.edge_method,
+                edge_threshold_fraction=recipe.threshold_fraction,
+            )
+            timestamp = row["timestamp"]
+            for i, stripe in enumerate(self._detection.stripes):
+                srow = {
+                    "image_file": self._current_img.filename,
+                    "stripe_index": i,
+                    "kind": stripe.kind,
+                    "width_um": stripe.width_px * calibration.um_per_px,
+                    "left_edge_um": stripe.left_edge_px * calibration.um_per_px,
+                    "right_edge_um": stripe.right_edge_px * calibration.um_per_px,
+                    "center_um": stripe.center_px * calibration.um_per_px,
+                    "recipe_name": recipe.name,
+                    "timestamp": timestamp,
+                }
+                if i < len(per_stripe_roughness):
+                    srow.update(per_stripe_roughness[i].to_dict())
+                self._session_stripe_rows.append(srow)
 
             n_white = len(self._detection.white_stripes)
             n_black = len(self._detection.black_stripes)
@@ -460,6 +507,21 @@ class MainWindow(QMainWindow):
             df = pd.DataFrame(self._session_results)
             export_results_csv(df, path)
             self._status_label.setText(f"Exported {len(df)} result(s) to {path}")
+
+    @pyqtSlot()
+    def _export_stripe_csv(self) -> None:
+        if not self._session_stripe_rows:
+            QMessageBox.information(self, "No Data", "Run analysis on at least one image first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Individual Stripes CSV", "", "CSV Files (*.csv)"
+        )
+        if path:
+            df = pd.DataFrame(self._session_stripe_rows)
+            export_stripe_rows_csv(df, path)
+            self._status_label.setText(
+                f"Exported {len(df)} stripe rows to {path}"
+            )
 
     @pyqtSlot()
     def _save_annotated(self) -> None:

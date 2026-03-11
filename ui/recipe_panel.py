@@ -68,6 +68,19 @@ class RecipePanel(QWidget):
         pre_form.addRow("Contrast:", self._contrast)
         layout.addWidget(grp_pre)
 
+        # ── Crop ──────────────────────────────────────────────────────
+        grp_crop = QGroupBox("Crop (each side)")
+        crop_form = QFormLayout(grp_crop)
+        self._crop_x = QSpinBox()
+        self._crop_x.setRange(0, 2000)
+        self._crop_x.setSuffix(" px")
+        self._crop_y = QSpinBox()
+        self._crop_y.setRange(0, 2000)
+        self._crop_y.setSuffix(" px")
+        crop_form.addRow("Crop X (left+right):", self._crop_x)
+        crop_form.addRow("Crop Y (top+bottom):", self._crop_y)
+        layout.addWidget(grp_crop)
+
         # ── Stripe Detection ──────────────────────────────────────────
         grp_sd = QGroupBox("Stripe Detection")
         sd_form = QFormLayout(grp_sd)
@@ -120,6 +133,7 @@ class RecipePanel(QWidget):
         for widget in [
             self._scale_spin, self._angle_offset, self._filter_sigma,
             self._threshold, self._min_width, self._smoothing,
+            self._crop_x, self._crop_y,
         ]:
             widget.valueChanged.connect(self._emit_changed)
         for cb in [self._angle_mode, self._filter_type, self._contrast, self._edge_method]:
@@ -145,6 +159,8 @@ class RecipePanel(QWidget):
         r.profile_lines = self._profile_lines.value()
         r.smoothing_sigma = self._smoothing.value()
         r.edge_method = self._edge_method.currentText()
+        r.crop_x_px = self._crop_x.value()
+        r.crop_y_px = self._crop_y.value()
         return r
 
     def get_recipe(self) -> Recipe:
@@ -155,6 +171,7 @@ class RecipePanel(QWidget):
         for widget in [
             self._scale_spin, self._angle_offset, self._filter_sigma,
             self._threshold, self._min_width, self._smoothing,
+            self._crop_x, self._crop_y,
         ]:
             widget.blockSignals(True)
         for cb in [self._angle_mode, self._filter_type, self._contrast, self._edge_method]:
@@ -172,10 +189,13 @@ class RecipePanel(QWidget):
         self._profile_lines.setValue(recipe.profile_lines)
         self._smoothing.setValue(recipe.smoothing_sigma)
         self._edge_method.setCurrentText(recipe.edge_method)
+        self._crop_x.setValue(recipe.crop_x_px)
+        self._crop_y.setValue(recipe.crop_y_px)
 
         for widget in [
             self._scale_spin, self._angle_offset, self._filter_sigma,
             self._threshold, self._min_width, self._smoothing,
+            self._crop_x, self._crop_y,
         ]:
             widget.blockSignals(False)
         for cb in [self._angle_mode, self._filter_type, self._contrast, self._edge_method]:
