@@ -24,7 +24,8 @@ from core.angle_detector import detect_angle, rotate_image
 from core.profile_extractor import extract_averaged_profile, extract_line_profile
 from core.stripe_detector import detect_stripes, StripeDetectionResult
 from core.measurements import (
-    compute_measurements_from_detection, compute_per_stripe_roughness, MeasurementResult,
+    compute_measurements_from_detection, compute_per_stripe_roughness,
+    collect_per_stripe_ler_points, MeasurementResult,
 )
 from core.recipe import Recipe
 
@@ -57,6 +58,7 @@ class MainWindow(QMainWindow):
         self._angle_deg: float = 0.0
         self._session_results: list[dict] = []
         self._session_stripe_rows: list[dict] = []
+        self._ler_points: list = []   # per-stripe LER sample points for current image
 
         self._build_ui()
         self._apply_dark_style()
@@ -181,9 +183,11 @@ class MainWindow(QMainWindow):
         act_run.triggered.connect(self._run_analysis)
         act_batch = QAction("Batch Processing…", self, shortcut="Ctrl+B")
         act_batch.triggered.connect(self._open_batch)
+        act_batch_dir = QAction("Batch Current Directory…", self, shortcut="Ctrl+Shift+B")
+        act_batch_dir.triggered.connect(self._batch_current_dir)
         act_cal = QAction("Set Scale from Scale Bar…", self)
         act_cal.triggered.connect(self._set_scale_from_scalebar)
-        analysis_menu.addActions([act_run, act_batch])
+        analysis_menu.addActions([act_run, act_batch, act_batch_dir])
         analysis_menu.addSeparator()
         analysis_menu.addAction(act_cal)
 
@@ -405,6 +409,8 @@ class MainWindow(QMainWindow):
 
             rotated = rotate_image(processed, self._angle_deg)
             self._rotated_image = rotated
+            # Always show the rotated (angle-corrected) image so that overlays align
+            self._canvas.set_image(rotated)
 
             # Profile extraction
             positions, profile = extract_averaged_profile(
@@ -439,8 +445,8 @@ class MainWindow(QMainWindow):
             )
 
             roi_offset = (roi[0], roi[1]) if roi else (0, 0)
-            img_h = processed.shape[0]
-            img_w = processed.shape[1]
+            img_h = rotated.shape[0]
+            img_w = rotated.shape[1]
             self._canvas.draw_stripe_overlays(
                 self._detection.stripes,
                 roi_offset=roi_offset,
@@ -458,13 +464,21 @@ class MainWindow(QMainWindow):
             row["recipe_name"] = recipe.name
             self._session_results.append(row)
 
-            # Per-stripe roughness and individual rows
+            # Per-stripe roughness and LER sample points
             per_stripe_roughness = compute_per_stripe_roughness(
                 self._detection, calibration,
                 rotated, roi,
                 edge_method=recipe.edge_method,
                 edge_threshold_fraction=recipe.threshold_fraction,
+                direction=recipe.profile_direction,
             )
+            self._ler_points = collect_per_stripe_ler_points(
+                self._detection, rotated, roi,
+                edge_method=recipe.edge_method,
+                edge_threshold_fraction=recipe.threshold_fraction,
+                direction=recipe.profile_direction,
+            )
+            self._canvas.draw_ler_points(self._ler_points)
             timestamp = row["timestamp"]
             for i, stripe in enumerate(self._detection.stripes):
                 srow = {
@@ -539,6 +553,8 @@ class MainWindow(QMainWindow):
                 self._current_roi,
                 path,
                 um_per_px=recipe.scale_um_per_px,
+                direction=recipe.profile_direction,
+                ler_points=self._ler_points,
             )
             self._status_label.setText(f"Saved annotated image: {path}")
 
@@ -546,6 +562,15 @@ class MainWindow(QMainWindow):
     def _open_batch(self) -> None:
         recipe = self._recipe_panel.get_recipe()
         dialog = BatchDialog(recipe, parent=self)
+        dialog.exec_()
+
+    @pyqtSlot()
+    def _batch_current_dir(self) -> None:
+        if not self._image_dir:
+            QMessageBox.information(self, "No Directory", "Open a directory first.")
+            return
+        recipe = self._recipe_panel.get_recipe()
+        dialog = BatchDialog(recipe, parent=self, prefill_dir=self._image_dir)
         dialog.exec_()
 
     @pyqtSlot()

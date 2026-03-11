@@ -18,23 +18,29 @@ class _BatchWorker(QObject):
     """Runs BatchProcessor in a background thread."""
     progress = pyqtSignal(int, int, str)   # current, total, filename
     error = pyqtSignal(str, str)           # filename, error_msg
-    finished = pyqtSignal(str)             # output CSV path
+    finished = pyqtSignal(str, str, str)   # output_csv, stripes_csv, annotated_dir
 
     def __init__(self, recipe: Recipe, image_dir: str, output_csv: str):
         super().__init__()
         self._recipe = recipe
         self._image_dir = image_dir
         self._output_csv = output_csv
+        # Derive companion output paths from the summary CSV path
+        stem, _ = os.path.splitext(output_csv)
+        self._stripes_csv = f"{stem}_stripes.csv"
+        self._annotated_dir = os.path.join(os.path.dirname(output_csv), "annotated")
         self._processor = BatchProcessor(recipe)
 
     def run(self) -> None:
-        df = self._processor.run(
+        self._processor.run(
             self._image_dir,
             output_csv=self._output_csv,
+            annotated_dir=self._annotated_dir,
+            output_stripes_csv=self._stripes_csv,
             progress_callback=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
             error_callback=lambda fn, msg: self.error.emit(fn, msg),
         )
-        self.finished.emit(self._output_csv)
+        self.finished.emit(self._output_csv, self._stripes_csv, self._annotated_dir)
 
     def cancel(self) -> None:
         self._processor.cancel()
@@ -43,7 +49,7 @@ class _BatchWorker(QObject):
 class BatchDialog(QDialog):
     """Batch processing dialog."""
 
-    def __init__(self, recipe: Recipe, parent=None):
+    def __init__(self, recipe: Recipe, parent=None, prefill_dir: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("Batch Processing")
         self.setMinimumSize(520, 440)
@@ -101,6 +107,12 @@ class BatchDialog(QDialog):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
+        # Pre-fill directory if supplied by caller
+        if prefill_dir:
+            self._dir_edit.setText(prefill_dir)
+            base = os.path.basename(prefill_dir.rstrip("/\\"))
+            self._out_edit.setText(os.path.join(prefill_dir, f"{base}_results.csv"))
+
     # ──────────────────────────────────────────────────────────────────
 
     def _browse_dir(self) -> None:
@@ -141,7 +153,7 @@ class BatchDialog(QDialog):
         self._thread.started.connect(self._worker.run)
         self._worker.progress.connect(self._on_progress)
         self._worker.error.connect(self._on_error)
-        self._worker.finished.connect(self._on_finished)
+        self._worker.finished.connect(self._on_finished)  # type: ignore[arg-type]
         self._thread.start()
 
     def _cancel_batch(self) -> None:
@@ -160,15 +172,23 @@ class BatchDialog(QDialog):
     def _on_error(self, filename: str, msg: str) -> None:
         self._log.append(f"  ⚠ ERROR in {filename}: {msg}")
 
-    def _on_finished(self, csv_path: str) -> None:
+    def _on_finished(self, csv_path: str, stripes_csv: str, annotated_dir: str) -> None:
         if self._thread:
             self._thread.quit()
             self._thread.wait()
         self._btn_run.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress_bar.setValue(self._progress_bar.maximum())
-        self._log.append(f"\n✓ Batch complete. Results saved to:\n  {csv_path}")
+        self._log.append(
+            f"\n✓ Batch complete.\n"
+            f"  Summary CSV:   {csv_path}\n"
+            f"  Stripes CSV:   {stripes_csv}\n"
+            f"  Annotated images: {annotated_dir}"
+        )
         QMessageBox.information(
             self, "Batch Complete",
-            f"Processing finished.\nResults saved to:\n{csv_path}"
+            f"Processing finished.\n\n"
+            f"Summary CSV:\n  {csv_path}\n\n"
+            f"Per-stripe CSV:\n  {stripes_csv}\n\n"
+            f"Annotated images:\n  {annotated_dir}"
         )
