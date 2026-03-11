@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QRectF, QPointF, pyqtSignal, QLineF
 from PyQt5.QtGui import (
     QPixmap, QImage, QColor, QPen, QBrush, QFont, QCursor,
-    QTransform,
+    QTransform, QPainter,
 )
 import numpy as np
 
@@ -69,7 +69,8 @@ class ImageCanvas(QGraphicsView):
         self._panning = False
         self._pan_start_pos = None
 
-        self.setRenderHint(self.renderHints().value, True)
+        self.setRenderHint(QPainter.Antialiasing, True)
+        self.setRenderHint(QPainter.SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.NoDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
