@@ -418,8 +418,13 @@ class MainWindow(QMainWindow):
 
             roi_offset = (roi[0], roi[1]) if roi else (0, 0)
             img_h = self._current_img.pixels.shape[0]
+            img_w = self._current_img.pixels.shape[1]
             self._canvas.draw_stripe_overlays(
-                self._detection.stripes, roi_offset=roi_offset, image_height=img_h
+                self._detection.stripes,
+                roi_offset=roi_offset,
+                image_height=img_h,
+                image_width=img_w,
+                direction=recipe.profile_direction,
             )
 
             # Store result for export

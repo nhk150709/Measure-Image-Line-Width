@@ -134,26 +134,45 @@ class ImageCanvas(QGraphicsView):
         item = self._scene.addRect(x, y, w, h, pen)
         self._roi_items.append(item)
 
-    def draw_stripe_overlays(self, stripes, roi_offset=(0, 0), image_height=512) -> None:
-        """Draw coloured vertical bands for each detected stripe."""
+    def draw_stripe_overlays(
+        self, stripes, roi_offset=(0, 0),
+        image_height=512, image_width=512,
+        direction="horizontal",
+    ) -> None:
+        """Draw coloured bands for each detected stripe.
+
+        direction='horizontal' — vertical stripes; bands are vertical columns.
+        direction='vertical'   — horizontal stripes; bands are horizontal rows.
+        """
         self.clear_stripe_overlays()
-        ox = roi_offset[0]
-        h = image_height
-        for stripe in stripes:
-            lx = stripe.left_edge_px + ox
-            rx = stripe.right_edge_px + ox
-            color = QColor(255, 80, 80, 60) if stripe.kind == "white" else QColor(80, 80, 255, 60)
-            edge_pen = QPen(QColor(0, 255, 100), 1)
+        edge_pen = QPen(QColor(0, 255, 100), 1)
 
-            # Shaded band
-            brush = QBrush(color)
-            band = self._scene.addRect(lx, 0, rx - lx, h, QPen(Qt.NoPen), brush)
-            self._stripe_items.append(band)
-
-            # Edge lines
-            l_line = self._scene.addLine(lx, 0, lx, h, edge_pen)
-            r_line = self._scene.addLine(rx, 0, rx, h, edge_pen)
-            self._stripe_items.extend([l_line, r_line])
+        if direction == "horizontal":
+            ox = roi_offset[0]
+            h = image_height
+            for stripe in stripes:
+                lx = stripe.left_edge_px + ox
+                rx = stripe.right_edge_px + ox
+                color = QColor(255, 80, 80, 60) if stripe.kind == "white" else QColor(80, 80, 255, 60)
+                brush = QBrush(color)
+                band = self._scene.addRect(lx, 0, rx - lx, h, QPen(Qt.NoPen), brush)
+                self._stripe_items.append(band)
+                l_line = self._scene.addLine(lx, 0, lx, h, edge_pen)
+                r_line = self._scene.addLine(rx, 0, rx, h, edge_pen)
+                self._stripe_items.extend([l_line, r_line])
+        else:  # "vertical" direction → horizontal stripes
+            oy = roi_offset[1]
+            w = image_width
+            for stripe in stripes:
+                ty = stripe.left_edge_px + oy
+                by = stripe.right_edge_px + oy
+                color = QColor(255, 80, 80, 60) if stripe.kind == "white" else QColor(80, 80, 255, 60)
+                brush = QBrush(color)
+                band = self._scene.addRect(0, ty, w, by - ty, QPen(Qt.NoPen), brush)
+                self._stripe_items.append(band)
+                t_line = self._scene.addLine(0, ty, w, ty, edge_pen)
+                b_line = self._scene.addLine(0, by, w, by, edge_pen)
+                self._stripe_items.extend([t_line, b_line])
 
     def draw_measurement_line(self, x1: int, y1: int, x2: int, y2: int,
                               label: str = "", color: QColor | None = None) -> None:
