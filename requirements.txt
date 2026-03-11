@@ -1,0 +1,10 @@
+PyQt5>=5.15
+opencv-python>=4.8
+numpy>=1.24
+scipy>=1.11
+matplotlib>=3.7
+pandas>=2.0
+tifffile>=2023.1
+Pillow>=10.0
+scikit-image>=0.21
+reportlab>=4.0
