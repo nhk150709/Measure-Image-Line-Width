@@ -65,12 +65,33 @@ def _avg_intensity(smoothed: np.ndarray, left: float, right: float, pk: int) -> 
     return float(np.mean(smoothed[l_int:r_int]))
 
 
+def _merge_two(a: Stripe, b: Stripe) -> Stripe:
+    """Merge two same-kind stripes into one stripe spanning both regions."""
+    left = min(a.left_edge_px, b.left_edge_px)
+    right = max(a.right_edge_px, b.right_edge_px)
+    width = right - left
+    center = (left + right) / 2.0
+    # Width-weighted average intensity
+    avg_intensity = (
+        (a.peak_intensity * a.width_px + b.peak_intensity * b.width_px)
+        / (a.width_px + b.width_px)
+    )
+    return Stripe(
+        kind=a.kind,
+        center_px=center,
+        left_edge_px=left,
+        right_edge_px=right,
+        width_px=width,
+        peak_intensity=avg_intensity,
+    )
+
+
 def _enforce_alternating(candidates: list[Stripe]) -> list[Stripe]:
     """
     Ensure stripes alternate black/white.
 
-    When two consecutive stripes have the same kind, drop the one that is
-    less extreme (less bright for white, less dark for black).
+    When two consecutive stripes share the same kind, merge them into one
+    larger stripe spanning both regions.
     """
     if not candidates:
         return []
@@ -78,13 +99,7 @@ def _enforce_alternating(candidates: list[Stripe]) -> list[Stripe]:
     for current in candidates[1:]:
         prev = result[-1]
         if current.kind == prev.kind:
-            # Keep the more extreme one
-            if current.kind == "white":
-                if current.peak_intensity > prev.peak_intensity:
-                    result[-1] = current
-            else:  # black
-                if current.peak_intensity < prev.peak_intensity:
-                    result[-1] = current
+            result[-1] = _merge_two(prev, current)
         else:
             result.append(current)
     return result

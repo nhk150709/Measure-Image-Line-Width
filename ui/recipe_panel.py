@@ -68,8 +68,8 @@ class RecipePanel(QWidget):
         pre_form.addRow("Contrast:", self._contrast)
         layout.addWidget(grp_pre)
 
-        # ── Crop ──────────────────────────────────────────────────────
-        grp_crop = QGroupBox("Crop (each side)")
+        # ── Ignore Margin ─────────────────────────────────────────────
+        grp_crop = QGroupBox("Ignore Margin (each side)")
         crop_form = QFormLayout(grp_crop)
         self._crop_x = QSpinBox()
         self._crop_x.setRange(0, 2000)
@@ -77,8 +77,8 @@ class RecipePanel(QWidget):
         self._crop_y = QSpinBox()
         self._crop_y.setRange(0, 2000)
         self._crop_y.setSuffix(" px")
-        crop_form.addRow("Crop X (left+right):", self._crop_x)
-        crop_form.addRow("Crop Y (top+bottom):", self._crop_y)
+        crop_form.addRow("Ignore X (left+right):", self._crop_x)
+        crop_form.addRow("Ignore Y (top+bottom):", self._crop_y)
         layout.addWidget(grp_crop)
 
         # ── Stripe Detection ──────────────────────────────────────────
