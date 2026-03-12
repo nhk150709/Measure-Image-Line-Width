@@ -56,6 +56,40 @@ class StripeDetectionResult:
         return float(np.mean(np.diff(centers)))
 
 
+def _avg_intensity(smoothed: np.ndarray, left: float, right: float, pk: int) -> float:
+    """Return mean profile intensity over the stripe region [left, right]."""
+    l_int = max(0, int(left))
+    r_int = min(len(smoothed), int(right) + 1)
+    if l_int >= r_int:
+        return float(smoothed[pk])
+    return float(np.mean(smoothed[l_int:r_int]))
+
+
+def _enforce_alternating(candidates: list[Stripe]) -> list[Stripe]:
+    """
+    Ensure stripes alternate black/white.
+
+    When two consecutive stripes have the same kind, drop the one that is
+    less extreme (less bright for white, less dark for black).
+    """
+    if not candidates:
+        return []
+    result: list[Stripe] = [candidates[0]]
+    for current in candidates[1:]:
+        prev = result[-1]
+        if current.kind == prev.kind:
+            # Keep the more extreme one
+            if current.kind == "white":
+                if current.peak_intensity > prev.peak_intensity:
+                    result[-1] = current
+            else:  # black
+                if current.peak_intensity < prev.peak_intensity:
+                    result[-1] = current
+        else:
+            result.append(current)
+    return result
+
+
 def detect_stripes(
     profile: np.ndarray,
     positions: np.ndarray | None = None,
@@ -98,25 +132,15 @@ def detect_stripes(
 
     prominence = max(5.0, prominence_fraction * contrast)
 
-    # ── Detect white stripes (peaks) ──────────────────────────────────
-    white_peaks, white_props = find_peaks(
-        smoothed,
-        prominence=prominence,
-        width=min_width_px,
-    )
+    # ── Detect white stripes (peaks) and black stripes (valleys) ──────
+    white_peaks, _ = find_peaks(smoothed,  prominence=prominence, width=min_width_px)
+    black_peaks, _ = find_peaks(-smoothed, prominence=prominence, width=min_width_px)
 
-    # ── Detect black stripes (valleys = peaks of inverted profile) ────
-    black_peaks, black_props = find_peaks(
-        -smoothed,
-        prominence=prominence,
-        width=min_width_px,
-    )
-
-    # ── Compute widths at half prominence ─────────────────────────────
-    stripes: list[Stripe] = []
+    # ── Collect all candidates with their regions ──────────────────────
+    candidates: list[Stripe] = []
 
     if len(white_peaks) > 0:
-        widths, _, left_ips, right_ips = peak_widths(
+        _, _, left_ips, right_ips = peak_widths(
             smoothed, white_peaks, rel_height=1 - threshold_fraction
         )
         for i, pk in enumerate(white_peaks):
@@ -125,17 +149,17 @@ def detect_stripes(
             w = right - left
             if w < min_width_px:
                 continue
-            stripes.append(Stripe(
+            candidates.append(Stripe(
                 kind="white",
                 center_px=float(pk),
                 left_edge_px=left,
                 right_edge_px=right,
                 width_px=w,
-                peak_intensity=float(smoothed[pk]),
+                peak_intensity=_avg_intensity(smoothed, left, right, pk),
             ))
 
     if len(black_peaks) > 0:
-        widths, _, left_ips, right_ips = peak_widths(
+        _, _, left_ips, right_ips = peak_widths(
             -smoothed, black_peaks, rel_height=1 - threshold_fraction
         )
         for i, pk in enumerate(black_peaks):
@@ -144,14 +168,29 @@ def detect_stripes(
             w = right - left
             if w < min_width_px:
                 continue
-            stripes.append(Stripe(
+            candidates.append(Stripe(
                 kind="black",
                 center_px=float(pk),
                 left_edge_px=left,
                 right_edge_px=right,
                 width_px=w,
-                peak_intensity=float(smoothed[pk]),
+                peak_intensity=_avg_intensity(smoothed, left, right, pk),
             ))
 
-    stripes.sort(key=lambda s: s.center_px)
+    # ── Sort all candidates by position ───────────────────────────────
+    candidates.sort(key=lambda s: s.center_px)
+
+    if not candidates:
+        return StripeDetectionResult(profile=profile, positions=positions)
+
+    # ── Reclassify by actual average intensity ─────────────────────────
+    # Stripes above the median average intensity are white; below are black.
+    # This prevents mislabelling caused by independent peak/valley detection.
+    intensity_threshold = float(np.median([s.peak_intensity for s in candidates]))
+    for s in candidates:
+        s.kind = "white" if s.peak_intensity >= intensity_threshold else "black"
+
+    # ── Enforce strict alternation ─────────────────────────────────────
+    stripes = _enforce_alternating(candidates)
+
     return StripeDetectionResult(stripes=stripes, profile=profile, positions=positions)
