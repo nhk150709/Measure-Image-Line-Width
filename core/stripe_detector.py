@@ -1,29 +1,50 @@
 """
-stripe_detector.py — Automatically detect white (photo resist) and black (spacing) stripes.
+stripe_detector.py — Gradient-based stripe boundary detection for SEM images.
 
-Works on an angle-corrected ROI where stripes run vertically (profile is horizontal).
+Stripes are detected by finding rising/falling edges in the 1st derivative
+of the intensity profile (gradient peaks), or at the zero-crossings of the
+2nd derivative (inflection points).  Edge pairs are then assembled into
+Stripe objects according to the selected pairing mode.
+
+Suggested methods
+-----------------
+gradient_peaks (default)
+    Peaks of |d I/dx|.  The positive peak marks a B→W (rising) transition;
+    the negative peak marks a W→B (falling) transition.  Robust for sharp
+    SEM interfaces.  Recommended starting point.
+
+zero_crossing
+    Zero-crossings of d²I/dx², i.e. where the gradient is changing fastest.
+    Gives the inflection point of each sigmoid-shaped transition.  More
+    sensitive to noise, but can locate the exact centre of a smooth edge
+    more precisely than gradient_peaks.
+
+Suggested pairing modes
+-----------------------
+rising_falling  – B→W then W→B  →  white stripe CD  (photoresist lines)
+falling_rising  – W→B then B→W  →  black stripe CD  (spaces / trenches)
+rising_rising   – B→W then B→W  →  full pitch
+falling_falling – W→B then W→B  →  full pitch
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import numpy as np
-from scipy.signal import find_peaks, peak_widths
+from scipy.signal import find_peaks
+from scipy.ndimage import gaussian_filter1d
 
+
+# ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
 class Stripe:
     """Represents one detected stripe (white or black)."""
     kind: str              # "white" | "black"
-    center_px: float       # center position in pixels (along profile axis)
-    left_edge_px: float    # left boundary in pixels
-    right_edge_px: float   # right boundary in pixels
-    width_px: float        # = right - left
-    peak_intensity: float  # peak (max for white, min for black)
-
-    @property
-    def width_um(self) -> float:
-        """Computed externally after calibration is applied."""
-        raise AttributeError("Call stripe.width_px * calibration.um_per_px instead")
+    center_px: float       # centre of the interval along the profile axis
+    left_edge_px: float    # position of the left edge (rising or falling)
+    right_edge_px: float   # position of the right edge
+    width_px: float        # right_edge_px − left_edge_px
+    peak_intensity: float  # mean profile intensity over the stripe region
 
 
 @dataclass
@@ -32,6 +53,12 @@ class StripeDetectionResult:
     profile: np.ndarray = field(default_factory=lambda: np.array([]))
     positions: np.ndarray = field(default_factory=lambda: np.array([]))
     angle_deg: float = 0.0
+    # Derivatives (always computed; used by the derivative plot)
+    gradient: np.ndarray = field(default_factory=lambda: np.array([]))
+    gradient2: np.ndarray = field(default_factory=lambda: np.array([]))
+    # Edge positions detected before pairing
+    rising_edges: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
+    falling_edges: np.ndarray = field(default_factory=lambda: np.array([], dtype=int))
 
     @property
     def white_stripes(self) -> list[Stripe]:
@@ -56,134 +83,189 @@ class StripeDetectionResult:
         return float(np.mean(np.diff(centers)))
 
 
-def _avg_intensity(smoothed: np.ndarray, left: float, right: float, pk: int) -> float:
-    """Return mean profile intensity over the stripe region [left, right]."""
-    l_int = max(0, int(left))
-    r_int = min(len(smoothed), int(right) + 1)
-    if l_int >= r_int:
-        return float(smoothed[pk])
-    return float(np.mean(smoothed[l_int:r_int]))
+# ── Edge detection ─────────────────────────────────────────────────────────────
+
+def _filter_min_distance(peaks: np.ndarray, min_dist: int) -> np.ndarray:
+    """Keep peaks that are at least min_dist apart; first peak in each cluster wins."""
+    if len(peaks) == 0:
+        return peaks
+    keep = [int(peaks[0])]
+    for p in peaks[1:]:
+        if int(p) - keep[-1] >= min_dist:
+            keep.append(int(p))
+    return np.array(keep, dtype=int)
 
 
-def _merge_two(a: Stripe, b: Stripe) -> Stripe:
-    """Merge two same-kind stripes into one stripe spanning both regions."""
-    left = min(a.left_edge_px, b.left_edge_px)
-    right = max(a.right_edge_px, b.right_edge_px)
-    width = right - left
-    center = (left + right) / 2.0
-    # Width-weighted average intensity
-    avg_intensity = (
-        (a.peak_intensity * a.width_px + b.peak_intensity * b.width_px)
-        / (a.width_px + b.width_px)
-    )
-    return Stripe(
-        kind=a.kind,
-        center_px=center,
-        left_edge_px=left,
-        right_edge_px=right,
-        width_px=width,
-        peak_intensity=avg_intensity,
-    )
-
-
-def _enforce_alternating(candidates: list[Stripe]) -> list[Stripe]:
-    """
-    Ensure stripes alternate black/white.
-
-    When two consecutive stripes share the same kind, merge them into one
-    larger stripe spanning both regions.
-    """
-    if not candidates:
-        return []
-    result: list[Stripe] = [candidates[0]]
-    for current in candidates[1:]:
-        prev = result[-1]
-        if current.kind == prev.kind:
-            result[-1] = _merge_two(prev, current)
-        else:
-            result.append(current)
-    return result
-
-
-def _merge_halo_triplets(
-    stripes: list[Stripe],
+def _detect_gradient_peaks(
     smoothed: np.ndarray,
-    lo: float,
-    contrast: float,
-    min_valley_depth_fraction: float,
+    min_distance_px: float,
+    prominence_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find rising and falling edges as positive/negative peaks of the 1st derivative.
+
+    Returns (rising_idxs, falling_idxs, gradient_1st, gradient_2nd).
+    """
+    grad1 = np.gradient(smoothed)
+    grad2 = np.gradient(grad1)
+
+    lo, hi = float(smoothed.min()), float(smoothed.max())
+    contrast = hi - lo
+    prominence = max(0.5, prominence_fraction * contrast)
+    dist = max(1, int(min_distance_px))
+
+    rising, _ = find_peaks(grad1, prominence=prominence, distance=dist)
+    falling, _ = find_peaks(-grad1, prominence=prominence, distance=dist)
+
+    return rising, falling, grad1, grad2
+
+
+def _detect_zero_crossings(
+    smoothed: np.ndarray,
+    min_distance_px: float,
+    prominence_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find rising/falling edges as zero-crossings of the 2nd derivative
+    (inflection points of the sigmoid-shaped intensity transitions).
+
+    Returns (rising_idxs, falling_idxs, gradient_1st, gradient_2nd).
+    """
+    grad1 = np.gradient(smoothed)
+    grad2 = np.gradient(grad1)
+
+    lo, hi = float(smoothed.min()), float(smoothed.max())
+    contrast = hi - lo
+    grad_threshold = max(0.5, prominence_fraction * contrast * 0.5)
+
+    sign2 = np.sign(grad2)
+    crossings = np.where(np.diff(sign2))[0]
+
+    rising_list: list[int] = []
+    falling_list: list[int] = []
+    for z in crossings:
+        if abs(grad1[z]) < grad_threshold:
+            continue
+        if grad1[z] > 0:
+            rising_list.append(int(z))
+        else:
+            falling_list.append(int(z))
+
+    dist = max(1, int(min_distance_px))
+    rising = _filter_min_distance(np.array(rising_list, dtype=int), dist)
+    falling = _filter_min_distance(np.array(falling_list, dtype=int), dist)
+
+    return rising, falling, grad1, grad2
+
+
+# ── Pairing ────────────────────────────────────────────────────────────────────
+
+def _pair_to_stripes(
+    rising: np.ndarray,
+    falling: np.ndarray,
+    pairing: str,
 ) -> list[Stripe]:
     """
-    Collapse W-B-W (or B-W-B) triplets caused by SEM edge-halo artefacts.
+    Assemble stripe intervals from edge positions.
 
-    For each A-sep-A triplet, measure the actual extremum of ``sep`` in the
-    smoothed profile.  If the separator is not extreme enough to be a genuine
-    stripe (e.g. the "black" between two bright halos is only medium-gray),
-    it is a halo gap: drop the separator and merge the outer two same-kind
-    stripes into one.
-
-    ``min_valley_depth_fraction`` (0–1): fraction of the contrast range that
-    a black separator's minimum must fall *below* to count as real.  A white
-    separator's maximum must rise *above* (1 − fraction).
-    Default 0.4 means a genuine black must have min < lo + 0.4 * contrast.
+    Pairing modes
+    -------------
+    "rising_falling"  – rising → next falling  → white stripe (B→W→B interval)
+    "falling_rising"  – falling → next rising  → black stripe (W→B→W interval)
+    "rising_rising"   – rising → next rising   → pitch (one full period)
+    "falling_falling" – falling → next falling → pitch (one full period)
     """
-    changed = True
-    while changed:
-        changed = False
-        i = 1
-        while i < len(stripes) - 1:
-            prev, sep, nxt = stripes[i - 1], stripes[i], stripes[i + 1]
-            if prev.kind != nxt.kind or sep.kind == prev.kind:
-                i += 1
-                continue
-            l_int = max(0, int(sep.left_edge_px))
-            r_int = min(len(smoothed), int(sep.right_edge_px) + 1)
-            region = smoothed[l_int:r_int]
-            if len(region) == 0:
-                i += 1
-                continue
-            if sep.kind == "black":
-                # genuine black: minimum well below lo + fraction*contrast
-                relative = (float(region.min()) - lo) / contrast
-                is_genuine = relative < min_valley_depth_fraction
-            else:  # sep is white between two blacks
-                relative = (float(region.max()) - lo) / contrast
-                is_genuine = relative > (1.0 - min_valley_depth_fraction)
-            if not is_genuine:
-                merged = _merge_two(prev, nxt)
-                stripes = stripes[: i - 1] + [merged] + stripes[i + 2 :]
-                changed = True
-            else:
-                i += 1
+    stripes: list[Stripe] = []
+
+    def _make(left: float, right: float, kind: str) -> Stripe:
+        w = right - left
+        return Stripe(
+            kind=kind,
+            center_px=(left + right) / 2.0,
+            left_edge_px=left,
+            right_edge_px=right,
+            width_px=w,
+            peak_intensity=0.0,  # filled in by _classify_by_intensity
+        )
+
+    if pairing == "rising_falling":
+        for r in rising:
+            nxt = falling[falling > r]
+            if len(nxt):
+                stripes.append(_make(float(r), float(nxt[0]), "white"))
+
+    elif pairing == "falling_rising":
+        for f in falling:
+            nxt = rising[rising > f]
+            if len(nxt):
+                stripes.append(_make(float(f), float(nxt[0]), "black"))
+
+    elif pairing == "rising_rising":
+        for i in range(len(rising) - 1):
+            stripes.append(_make(float(rising[i]), float(rising[i + 1]), "white"))
+
+    elif pairing == "falling_falling":
+        for i in range(len(falling) - 1):
+            stripes.append(_make(float(falling[i]), float(falling[i + 1]), "black"))
+
     return stripes
 
+
+# ── Classification ─────────────────────────────────────────────────────────────
+
+def _classify_by_intensity(stripes: list[Stripe], smoothed: np.ndarray) -> None:
+    """
+    Compute mean profile intensity for every stripe region, then reclassify
+    each stripe as white or black by comparing its mean to the overall profile
+    median.  Modifies stripes in-place.
+    """
+    if not stripes:
+        return
+    overall_median = float(np.median(smoothed))
+    for s in stripes:
+        l_int = max(0, int(s.left_edge_px))
+        r_int = min(len(smoothed), int(s.right_edge_px) + 1)
+        if r_int > l_int:
+            s.peak_intensity = float(np.mean(smoothed[l_int:r_int]))
+        else:
+            s.peak_intensity = float(smoothed[max(0, l_int)])
+        s.kind = "white" if s.peak_intensity >= overall_median else "black"
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
 
 def detect_stripes(
     profile: np.ndarray,
     positions: np.ndarray | None = None,
-    threshold_fraction: float = 0.5,
-    min_width_px: float = 3.0,
     smoothing_sigma: float = 2.0,
     prominence_fraction: float = 0.15,
-    min_valley_depth_fraction: float = 0.4,
+    edge_detect_method: str = "gradient_peaks",
+    edge_pairing: str = "rising_falling",
+    min_edge_distance_px: float = 5.0,
 ) -> StripeDetectionResult:
     """
-    Detect alternating white/black stripes from a 1D intensity profile.
+    Detect stripes from a 1D intensity profile using gradient-based edge detection.
 
     Parameters
     ----------
-    profile          : 1D intensity array (averaged rows from the ROI)
-    positions        : x-axis pixel positions (defaults to 0..N-1)
-    threshold_fraction : fraction of intensity range for white/black separation
-    min_width_px     : minimum stripe width in pixels (rejects noise)
-    smoothing_sigma  : Gaussian sigma for smoothing before peak finding
-    prominence_fraction : min peak prominence as fraction of intensity range
-    min_valley_depth_fraction : fraction of contrast range a black stripe
-        minimum must fall below (or a white stripe maximum must rise above)
-        to be treated as a genuine stripe rather than a halo artefact (0–1)
+    profile               : 1D intensity array (averaged rows / columns from the ROI)
+    positions             : pixel positions along the profile axis (defaults to 0..N-1)
+    smoothing_sigma       : Gaussian sigma applied to the profile before differentiation
+    prominence_fraction   : minimum edge prominence as a fraction of the intensity contrast
+    edge_detect_method    : "gradient_peaks"  – peaks of 1st derivative (recommended for
+                              sharp SEM transitions; robust and direct)
+                            "zero_crossing"   – zero-crossings of 2nd derivative (inflection
+                              points; more sensitive for smooth / gradual transitions)
+    edge_pairing          : "rising_falling"  → white stripe CD
+                            "falling_rising"  → black stripe / space CD
+                            "rising_rising"   → pitch
+                            "falling_falling" → pitch
+    min_edge_distance_px  : edges closer than this many pixels are suppressed (noise rejection)
 
     Returns
     -------
-    StripeDetectionResult with detected stripes list
+    StripeDetectionResult containing stripes, profile, both derivative arrays,
+    and the raw rising / falling edge positions.
     """
     if positions is None:
         positions = np.arange(len(profile), dtype=float)
@@ -192,82 +274,30 @@ def detect_stripes(
     if n < 10:
         return StripeDetectionResult(profile=profile, positions=positions)
 
-    # Smooth the profile
-    from scipy.ndimage import gaussian_filter1d
     smoothed = gaussian_filter1d(profile.astype(float), max(0.5, smoothing_sigma))
 
     lo, hi = float(smoothed.min()), float(smoothed.max())
-    contrast = hi - lo
-    if contrast < 1:
+    if hi - lo < 1:
         return StripeDetectionResult(profile=profile, positions=positions)
 
-    prominence = max(5.0, prominence_fraction * contrast)
-
-    # ── Detect white stripes (peaks) and black stripes (valleys) ──────
-    white_peaks, _ = find_peaks(smoothed,  prominence=prominence, width=min_width_px)
-    black_peaks, _ = find_peaks(-smoothed, prominence=prominence, width=min_width_px)
-
-    # ── Collect all candidates with their regions ──────────────────────
-    candidates: list[Stripe] = []
-
-    if len(white_peaks) > 0:
-        _, _, left_ips, right_ips = peak_widths(
-            smoothed, white_peaks, rel_height=1 - threshold_fraction
+    if edge_detect_method == "zero_crossing":
+        rising, falling, grad1, grad2 = _detect_zero_crossings(
+            smoothed, min_edge_distance_px, prominence_fraction
         )
-        for i, pk in enumerate(white_peaks):
-            left = float(left_ips[i])
-            right = float(right_ips[i])
-            w = right - left
-            if w < min_width_px:
-                continue
-            candidates.append(Stripe(
-                kind="white",
-                center_px=float(pk),
-                left_edge_px=left,
-                right_edge_px=right,
-                width_px=w,
-                peak_intensity=_avg_intensity(smoothed, left, right, pk),
-            ))
-
-    if len(black_peaks) > 0:
-        _, _, left_ips, right_ips = peak_widths(
-            -smoothed, black_peaks, rel_height=1 - threshold_fraction
-        )
-        for i, pk in enumerate(black_peaks):
-            left = float(left_ips[i])
-            right = float(right_ips[i])
-            w = right - left
-            if w < min_width_px:
-                continue
-            candidates.append(Stripe(
-                kind="black",
-                center_px=float(pk),
-                left_edge_px=left,
-                right_edge_px=right,
-                width_px=w,
-                peak_intensity=_avg_intensity(smoothed, left, right, pk),
-            ))
-
-    # ── Sort all candidates by position ───────────────────────────────
-    candidates.sort(key=lambda s: s.center_px)
-
-    if not candidates:
-        return StripeDetectionResult(profile=profile, positions=positions)
-
-    # ── Reclassify by actual average intensity ─────────────────────────
-    # Stripes above the median average intensity are white; below are black.
-    # This prevents mislabelling caused by independent peak/valley detection.
-    intensity_threshold = float(np.median([s.peak_intensity for s in candidates]))
-    for s in candidates:
-        s.kind = "white" if s.peak_intensity >= intensity_threshold else "black"
-
-    # ── Enforce strict alternation ─────────────────────────────────────
-    stripes = _enforce_alternating(candidates)
-
-    # ── Collapse halo artefact triplets (e.g. bright-edge / gray / bright-edge)
-    if min_valley_depth_fraction > 0:
-        stripes = _merge_halo_triplets(
-            stripes, smoothed, lo, contrast, min_valley_depth_fraction
+    else:  # "gradient_peaks" (default)
+        rising, falling, grad1, grad2 = _detect_gradient_peaks(
+            smoothed, min_edge_distance_px, prominence_fraction
         )
 
-    return StripeDetectionResult(stripes=stripes, profile=profile, positions=positions)
+    stripes = _pair_to_stripes(rising, falling, edge_pairing)
+    _classify_by_intensity(stripes, smoothed)
+
+    return StripeDetectionResult(
+        stripes=stripes,
+        profile=profile,
+        positions=positions,
+        gradient=grad1,
+        gradient2=grad2,
+        rising_edges=rising,
+        falling_edges=falling,
+    )
