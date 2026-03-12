@@ -246,7 +246,9 @@ class MainWindow(QMainWindow):
     def _load_image(self, path: str) -> None:
         try:
             self._current_img = load_image(path)
-            self._canvas.set_image(self._current_img.pixels)
+            recipe = self._recipe_panel.get_recipe()
+            pixels = self._apply_crop(self._current_img.pixels, recipe)
+            self._canvas.set_image(pixels)
             self._canvas.clear_overlays()
             self._current_roi = None
             self._detection = None
@@ -354,6 +356,24 @@ class MainWindow(QMainWindow):
             f"({best.width_px:.1f} px)"
         )
 
+    @staticmethod
+    def _apply_crop(pixels: np.ndarray, recipe) -> np.ndarray:
+        """Physically crop pixels using the four per-side crop values in recipe."""
+        t = recipe.crop_top_px
+        b = recipe.crop_bottom_px
+        l = recipe.crop_left_px
+        r = recipe.crop_right_px
+        if t == 0 and b == 0 and l == 0 and r == 0:
+            return pixels
+        h, w = pixels.shape[:2]
+        y1 = t
+        y2 = h - b if b > 0 else h
+        x1 = l
+        x2 = w - r if r > 0 else w
+        if y1 < y2 and x1 < x2:
+            return pixels[y1:y2, x1:x2]
+        return pixels
+
     @pyqtSlot(Recipe)
     def _on_recipe_changed(self, recipe: Recipe) -> None:
         pass  # Could auto-run preview; currently on-demand
@@ -377,28 +397,18 @@ class MainWindow(QMainWindow):
             )
             processed = preprocessor.process(self._current_img.pixels)
 
-            # Ignore margin: keep the image full-size and restrict the
-            # analysis region instead of physically slicing the array.
-            cx, cy = recipe.crop_x_px, recipe.crop_y_px
-            ph, pw = processed.shape[:2]
-            if cx > 0 or cy > 0:
-                crop_roi: tuple | None = (cx, cy, pw - 2 * cx, ph - 2 * cy)
-            else:
-                crop_roi = None
+            # Physical 4-directional crop (applied before display and analysis)
+            processed = self._apply_crop(processed, recipe)
+            self._canvas.set_image(processed)
 
-            user_roi = self._current_roi or recipe.roi_tuple
-            if crop_roi is not None and user_roi is not None:
-                cx0, cy0, cw, ch = crop_roi
-                ux, uy, uw, uh = user_roi
-                ix = max(cx0, ux)
-                iy = max(cy0, uy)
-                ix2 = min(cx0 + cw, ux + uw)
-                iy2 = min(cy0 + ch, uy + uh)
-                roi = (ix, iy, ix2 - ix, iy2 - iy) if ix2 > ix and iy2 > iy else crop_roi
-            elif crop_roi is not None:
-                roi = crop_roi
-            else:
-                roi = user_roi
+            # Validate ROI against cropped dimensions
+            ph, pw = processed.shape[:2]
+            roi = self._current_roi or recipe.roi_tuple
+            if roi is not None:
+                rx, ry, rw, rh = roi
+                if rx < 0 or ry < 0 or rx + rw > pw or ry + rh > ph:
+                    roi = None
+                    self._current_roi = None
 
             # Angle detection
             roi_region = processed
@@ -424,13 +434,15 @@ class MainWindow(QMainWindow):
                 direction=recipe.profile_direction,
             )
 
-            # Stripe detection
+            # Stripe detection (gradient-based)
+            min_edge_px = recipe.min_edge_distance_um / max(recipe.scale_um_per_px, 1e-9)
             self._detection = detect_stripes(
                 profile, positions=positions,
-                threshold_fraction=recipe.threshold_fraction,
-                min_width_px=recipe.min_stripe_width_px,
                 smoothing_sigma=recipe.smoothing_sigma,
-                min_valley_depth_fraction=recipe.min_valley_depth_fraction,
+                prominence_fraction=recipe.prominence_fraction,
+                edge_detect_method=recipe.edge_detect_method,
+                edge_pairing=recipe.edge_pairing,
+                min_edge_distance_px=min_edge_px,
             )
             self._detection.angle_deg = self._angle_deg
 
@@ -442,12 +454,27 @@ class MainWindow(QMainWindow):
                 edge_threshold_fraction=recipe.threshold_fraction,
             )
 
+            # Choose which derivative to display
+            if recipe.show_derivative_order == 1:
+                derivative = self._detection.gradient
+                deriv_label = "1st Derivative  dI/dx"
+            elif recipe.show_derivative_order == 2:
+                derivative = self._detection.gradient2
+                deriv_label = "2nd Derivative  d²I/dx²"
+            else:
+                derivative = None
+                deriv_label = ""
+
             # Update displays
             self._meas_panel.update_results(self._result, self._detection)
             self._profile_plot.plot_profile(
                 positions, profile,
                 stripes=self._detection.stripes,
                 um_per_px=calibration.um_per_px,
+                derivative=derivative,
+                derivative_label=deriv_label,
+                rising_edges=self._detection.rising_edges,
+                falling_edges=self._detection.falling_edges,
             )
 
             roi_offset = (roi[0], roi[1]) if roi else (0, 0)

@@ -158,25 +158,17 @@ class BatchProcessor:
 
         processed = preprocessor.process(img_data.pixels)
 
-        # Ignore margin: keep the image full-size and restrict the
-        # analysis region instead of physically slicing the array.
-        cx, cy = recipe.crop_x_px, recipe.crop_y_px
-        ph, pw = processed.shape[:2]
-        crop_roi: tuple | None = (cx, cy, pw - 2 * cx, ph - 2 * cy) if (cx > 0 or cy > 0) else None
+        # Physical 4-directional crop
+        t, b, l, r = (recipe.crop_top_px, recipe.crop_bottom_px,
+                      recipe.crop_left_px, recipe.crop_right_px)
+        if t > 0 or b > 0 or l > 0 or r > 0:
+            ph, pw = processed.shape[:2]
+            y1, y2 = t, (ph - b if b > 0 else ph)
+            x1, x2 = l, (pw - r if r > 0 else pw)
+            if y1 < y2 and x1 < x2:
+                processed = processed[y1:y2, x1:x2]
 
-        user_roi = recipe.roi_tuple
-        if crop_roi is not None and user_roi is not None:
-            cx0, cy0, cw, ch = crop_roi
-            ux, uy, uw, uh = user_roi
-            ix = max(cx0, ux)
-            iy = max(cy0, uy)
-            ix2 = min(cx0 + cw, ux + uw)
-            iy2 = min(cy0 + ch, uy + uh)
-            roi = (ix, iy, ix2 - ix, iy2 - iy) if ix2 > ix and iy2 > iy else crop_roi
-        elif crop_roi is not None:
-            roi = crop_roi
-        else:
-            roi = user_roi
+        roi = recipe.roi_tuple
 
         # Detect angle
         if roi is not None:
@@ -201,14 +193,16 @@ class BatchProcessor:
             direction=recipe.profile_direction,
         )
 
-        # Detect stripes
+        # Detect stripes (gradient-based)
+        min_edge_px = recipe.min_edge_distance_um / max(recipe.scale_um_per_px, 1e-9)
         detection = detect_stripes(
             profile,
             positions=positions,
-            threshold_fraction=recipe.threshold_fraction,
-            min_width_px=recipe.min_stripe_width_px,
             smoothing_sigma=recipe.smoothing_sigma,
-            min_valley_depth_fraction=recipe.min_valley_depth_fraction,
+            prominence_fraction=recipe.prominence_fraction,
+            edge_detect_method=recipe.edge_detect_method,
+            edge_pairing=recipe.edge_pairing,
+            min_edge_distance_px=min_edge_px,
         )
         detection.angle_deg = angle_deg
 
