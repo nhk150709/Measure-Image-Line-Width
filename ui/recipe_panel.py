@@ -99,10 +99,22 @@ class RecipePanel(QWidget):
         self._smoothing = QDoubleSpinBox()
         self._smoothing.setRange(0.1, 20.0)
         self._smoothing.setValue(2.0)
+        self._min_valley_depth = QDoubleSpinBox()
+        self._min_valley_depth.setRange(0.0, 1.0)
+        self._min_valley_depth.setDecimals(2)
+        self._min_valley_depth.setSingleStep(0.05)
+        self._min_valley_depth.setValue(0.4)
+        self._min_valley_depth.setToolTip(
+            "Halo artefact suppression: fraction of the contrast range that a\n"
+            "black stripe's minimum must fall below to be treated as genuine.\n"
+            "Raise this if bright edge halos are split into multiple stripes.\n"
+            "Set to 0 to disable."
+        )
         sd_form.addRow("Threshold (fraction):", self._threshold)
         sd_form.addRow("Min stripe width:", self._min_width)
         sd_form.addRow("Profile lines:", self._profile_lines)
         sd_form.addRow("Smoothing sigma:", self._smoothing)
+        sd_form.addRow("Halo suppression:", self._min_valley_depth)
         layout.addWidget(grp_sd)
 
         # ── Edge Detection ────────────────────────────────────────────
@@ -133,7 +145,7 @@ class RecipePanel(QWidget):
         for widget in [
             self._scale_spin, self._angle_offset, self._filter_sigma,
             self._threshold, self._min_width, self._smoothing,
-            self._crop_x, self._crop_y,
+            self._crop_x, self._crop_y, self._min_valley_depth,
         ]:
             widget.valueChanged.connect(self._emit_changed)
         for cb in [self._angle_mode, self._filter_type, self._contrast, self._edge_method]:
@@ -158,6 +170,7 @@ class RecipePanel(QWidget):
         r.min_stripe_width_px = self._min_width.value()
         r.profile_lines = self._profile_lines.value()
         r.smoothing_sigma = self._smoothing.value()
+        r.min_valley_depth_fraction = self._min_valley_depth.value()
         r.edge_method = self._edge_method.currentText()
         r.crop_x_px = self._crop_x.value()
         r.crop_y_px = self._crop_y.value()
@@ -171,7 +184,7 @@ class RecipePanel(QWidget):
         for widget in [
             self._scale_spin, self._angle_offset, self._filter_sigma,
             self._threshold, self._min_width, self._smoothing,
-            self._crop_x, self._crop_y,
+            self._crop_x, self._crop_y, self._min_valley_depth,
         ]:
             widget.blockSignals(True)
         for cb in [self._angle_mode, self._filter_type, self._contrast, self._edge_method]:
@@ -188,6 +201,7 @@ class RecipePanel(QWidget):
         self._min_width.setValue(recipe.min_stripe_width_px)
         self._profile_lines.setValue(recipe.profile_lines)
         self._smoothing.setValue(recipe.smoothing_sigma)
+        self._min_valley_depth.setValue(recipe.min_valley_depth_fraction)
         self._edge_method.setCurrentText(recipe.edge_method)
         self._crop_x.setValue(recipe.crop_x_px)
         self._crop_y.setValue(recipe.crop_y_px)
@@ -195,7 +209,7 @@ class RecipePanel(QWidget):
         for widget in [
             self._scale_spin, self._angle_offset, self._filter_sigma,
             self._threshold, self._min_width, self._smoothing,
-            self._crop_x, self._crop_y,
+            self._crop_x, self._crop_y, self._min_valley_depth,
         ]:
             widget.blockSignals(False)
         for cb in [self._angle_mode, self._filter_type, self._contrast, self._edge_method]:

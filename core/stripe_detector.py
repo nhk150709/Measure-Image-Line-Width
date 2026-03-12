@@ -105,6 +105,58 @@ def _enforce_alternating(candidates: list[Stripe]) -> list[Stripe]:
     return result
 
 
+def _merge_halo_triplets(
+    stripes: list[Stripe],
+    smoothed: np.ndarray,
+    lo: float,
+    contrast: float,
+    min_valley_depth_fraction: float,
+) -> list[Stripe]:
+    """
+    Collapse W-B-W (or B-W-B) triplets caused by SEM edge-halo artefacts.
+
+    For each A-sep-A triplet, measure the actual extremum of ``sep`` in the
+    smoothed profile.  If the separator is not extreme enough to be a genuine
+    stripe (e.g. the "black" between two bright halos is only medium-gray),
+    it is a halo gap: drop the separator and merge the outer two same-kind
+    stripes into one.
+
+    ``min_valley_depth_fraction`` (0–1): fraction of the contrast range that
+    a black separator's minimum must fall *below* to count as real.  A white
+    separator's maximum must rise *above* (1 − fraction).
+    Default 0.4 means a genuine black must have min < lo + 0.4 * contrast.
+    """
+    changed = True
+    while changed:
+        changed = False
+        i = 1
+        while i < len(stripes) - 1:
+            prev, sep, nxt = stripes[i - 1], stripes[i], stripes[i + 1]
+            if prev.kind != nxt.kind or sep.kind == prev.kind:
+                i += 1
+                continue
+            l_int = max(0, int(sep.left_edge_px))
+            r_int = min(len(smoothed), int(sep.right_edge_px) + 1)
+            region = smoothed[l_int:r_int]
+            if len(region) == 0:
+                i += 1
+                continue
+            if sep.kind == "black":
+                # genuine black: minimum well below lo + fraction*contrast
+                relative = (float(region.min()) - lo) / contrast
+                is_genuine = relative < min_valley_depth_fraction
+            else:  # sep is white between two blacks
+                relative = (float(region.max()) - lo) / contrast
+                is_genuine = relative > (1.0 - min_valley_depth_fraction)
+            if not is_genuine:
+                merged = _merge_two(prev, nxt)
+                stripes = stripes[: i - 1] + [merged] + stripes[i + 2 :]
+                changed = True
+            else:
+                i += 1
+    return stripes
+
+
 def detect_stripes(
     profile: np.ndarray,
     positions: np.ndarray | None = None,
@@ -112,6 +164,7 @@ def detect_stripes(
     min_width_px: float = 3.0,
     smoothing_sigma: float = 2.0,
     prominence_fraction: float = 0.15,
+    min_valley_depth_fraction: float = 0.4,
 ) -> StripeDetectionResult:
     """
     Detect alternating white/black stripes from a 1D intensity profile.
@@ -124,6 +177,9 @@ def detect_stripes(
     min_width_px     : minimum stripe width in pixels (rejects noise)
     smoothing_sigma  : Gaussian sigma for smoothing before peak finding
     prominence_fraction : min peak prominence as fraction of intensity range
+    min_valley_depth_fraction : fraction of contrast range a black stripe
+        minimum must fall below (or a white stripe maximum must rise above)
+        to be treated as a genuine stripe rather than a halo artefact (0–1)
 
     Returns
     -------
@@ -207,5 +263,11 @@ def detect_stripes(
 
     # ── Enforce strict alternation ─────────────────────────────────────
     stripes = _enforce_alternating(candidates)
+
+    # ── Collapse halo artefact triplets (e.g. bright-edge / gray / bright-edge)
+    if min_valley_depth_fraction > 0:
+        stripes = _merge_halo_triplets(
+            stripes, smoothed, lo, contrast, min_valley_depth_fraction
+        )
 
     return StripeDetectionResult(stripes=stripes, profile=profile, positions=positions)

@@ -430,6 +430,7 @@ class MainWindow(QMainWindow):
                 threshold_fraction=recipe.threshold_fraction,
                 min_width_px=recipe.min_stripe_width_px,
                 smoothing_sigma=recipe.smoothing_sigma,
+                min_valley_depth_fraction=recipe.min_valley_depth_fraction,
             )
             self._detection.angle_deg = self._angle_deg
 

@@ -39,6 +39,7 @@ class Recipe:
     smoothing_sigma: float = 2.0
     profile_lines: int = 20
     profile_direction: str = "horizontal"  # "horizontal" | "vertical"
+    min_valley_depth_fraction: float = 0.4  # halo artefact suppression (0 = off)
 
     # Edge detection
     edge_method: str = "canny"  # "threshold" | "canny" | "sigmoid"

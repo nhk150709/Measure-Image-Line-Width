@@ -208,6 +208,7 @@ class BatchProcessor:
             threshold_fraction=recipe.threshold_fraction,
             min_width_px=recipe.min_stripe_width_px,
             smoothing_sigma=recipe.smoothing_sigma,
+            min_valley_depth_fraction=recipe.min_valley_depth_fraction,
         )
         detection.angle_deg = angle_deg
 
