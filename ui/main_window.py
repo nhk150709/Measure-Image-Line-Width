@@ -377,23 +377,28 @@ class MainWindow(QMainWindow):
             )
             processed = preprocessor.process(self._current_img.pixels)
 
-            # Crop borders
+            # Ignore margin: keep the image full-size and restrict the
+            # analysis region instead of physically slicing the array.
             cx, cy = recipe.crop_x_px, recipe.crop_y_px
+            ph, pw = processed.shape[:2]
             if cx > 0 or cy > 0:
-                ph, pw = processed.shape[:2]
-                x1 = cx if cx > 0 else 0
-                x2 = pw - cx if cx > 0 else pw
-                y1 = cy if cy > 0 else 0
-                y2 = ph - cy if cy > 0 else ph
-                processed = processed[y1:y2, x1:x2]
-                self._canvas.set_image(processed)
-                # ROI coords must lie within cropped image; reset if out of bounds
-                if self._current_roi is not None:
-                    rx, ry, rw, rh = self._current_roi
-                    if rx < 0 or ry < 0 or rx + rw > x2 - x1 or ry + rh > y2 - y1:
-                        self._current_roi = None
+                crop_roi: tuple | None = (cx, cy, pw - 2 * cx, ph - 2 * cy)
+            else:
+                crop_roi = None
 
-            roi = self._current_roi or recipe.roi_tuple
+            user_roi = self._current_roi or recipe.roi_tuple
+            if crop_roi is not None and user_roi is not None:
+                cx0, cy0, cw, ch = crop_roi
+                ux, uy, uw, uh = user_roi
+                ix = max(cx0, ux)
+                iy = max(cy0, uy)
+                ix2 = min(cx0 + cw, ux + uw)
+                iy2 = min(cy0 + ch, uy + uh)
+                roi = (ix, iy, ix2 - ix, iy2 - iy) if ix2 > ix and iy2 > iy else crop_roi
+            elif crop_roi is not None:
+                roi = crop_roi
+            else:
+                roi = user_roi
 
             # Angle detection
             roi_region = processed
@@ -425,6 +430,7 @@ class MainWindow(QMainWindow):
                 threshold_fraction=recipe.threshold_fraction,
                 min_width_px=recipe.min_stripe_width_px,
                 smoothing_sigma=recipe.smoothing_sigma,
+                min_valley_depth_fraction=recipe.min_valley_depth_fraction,
             )
             self._detection.angle_deg = self._angle_deg
 

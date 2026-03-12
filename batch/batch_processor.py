@@ -158,17 +158,25 @@ class BatchProcessor:
 
         processed = preprocessor.process(img_data.pixels)
 
-        # Apply crop
+        # Ignore margin: keep the image full-size and restrict the
+        # analysis region instead of physically slicing the array.
         cx, cy = recipe.crop_x_px, recipe.crop_y_px
-        if cx > 0 or cy > 0:
-            ph, pw = processed.shape[:2]
-            processed = processed[
-                cy: ph - cy if cy else ph,
-                cx: pw - cx if cx else pw,
-            ]
+        ph, pw = processed.shape[:2]
+        crop_roi: tuple | None = (cx, cy, pw - 2 * cx, ph - 2 * cy) if (cx > 0 or cy > 0) else None
 
-        # Apply ROI
-        roi = recipe.roi_tuple
+        user_roi = recipe.roi_tuple
+        if crop_roi is not None and user_roi is not None:
+            cx0, cy0, cw, ch = crop_roi
+            ux, uy, uw, uh = user_roi
+            ix = max(cx0, ux)
+            iy = max(cy0, uy)
+            ix2 = min(cx0 + cw, ux + uw)
+            iy2 = min(cy0 + ch, uy + uh)
+            roi = (ix, iy, ix2 - ix, iy2 - iy) if ix2 > ix and iy2 > iy else crop_roi
+        elif crop_roi is not None:
+            roi = crop_roi
+        else:
+            roi = user_roi
 
         # Detect angle
         if roi is not None:
@@ -200,6 +208,7 @@ class BatchProcessor:
             threshold_fraction=recipe.threshold_fraction,
             min_width_px=recipe.min_stripe_width_px,
             smoothing_sigma=recipe.smoothing_sigma,
+            min_valley_depth_fraction=recipe.min_valley_depth_fraction,
         )
         detection.angle_deg = angle_deg
 
